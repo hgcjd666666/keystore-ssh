@@ -371,6 +371,32 @@ public final class SshKeyVault {
         return listEntries(ctx).isEmpty();
     }
 
+    /**
+     * 把公钥列表写成 filesDir/pubkeys.json，供 root 侧 agent 做 identities 应答。
+     * 只有公钥（本来就是公开信息），不含任何私钥材料。
+     */
+    public static void writePublicIndex(Context ctx) {
+        try {
+            JSONArray arr = new JSONArray();
+            for (Entry e : listEntries(ctx)) {
+                JSONObject o = new JSONObject();
+                o.put("comment", e.comment == null ? "" : e.comment);
+                o.put("pub", e.pubBlobB64);
+                arr.put(o);
+            }
+            java.io.File f = new java.io.File(ctx.getFilesDir(), "pubkeys.json");
+            java.io.FileWriter w = new java.io.FileWriter(f, false);
+            try {
+                w.write(arr.toString());
+            } finally {
+                w.close();
+            }
+            f.setReadable(true, false);   // root agent 要读
+        } catch (Throwable t) {
+            android.util.Log.w("SshKeyVault", "writePublicIndex failed: " + t);
+        }
+    }
+
     private static void saveAll(Context ctx, List<Entry> list) {
         try {
             JSONArray arr = new JSONArray();

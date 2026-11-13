@@ -12,9 +12,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -28,7 +26,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
@@ -36,26 +33,18 @@ import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.Key
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
 import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -69,7 +58,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -86,10 +74,13 @@ import kotlinx.coroutines.withContext
 import kotlin.coroutines.resume
 
 /**
- * 主界面：Material 3 + Compose，跟 KernelSU 一样的卡片式布局。
+ * 密钥管理界面。
  *
- *   密钥页：服务状态卡片 / 密钥卡片（comment + 指纹 + 操作）/ 生成·导入
- *   日志页：AgentLog 的实时环形日志
+ * 这个 App 是「空壳」：只负责 Keystore 里的私钥和指纹授权，不跑网络服务。
+ * TCP agent 在 root 侧（app_process / C），它用 am start 拉起 SignActivity 来签名。
+ *
+ *   · 密钥页：列表 / 生成 / 导入 / 删除 / 复制公钥
+ *   · 日志页：签名与错误记录
  */
 class MainActivity : ComponentActivity() {
 
@@ -101,15 +92,8 @@ class MainActivity : ComponentActivity() {
                 App(activity = this)
             }
         }
-        try {
-            AgentService.start(this)
-        } catch (t: Throwable) {
-            AgentLog.add("KeystoreSSH", "agent start failed: $t")
-        }
     }
 }
-
-// ---------------------------------------------------------------- 视图模型
 
 data class KeyVm(
     val id: String,
@@ -117,22 +101,6 @@ data class KeyVm(
     val fingerprint: String,
     val pubLine: String,
 )
-
-data class SvcStatus(
-    val running: Boolean,
-    val tcpEnabled: Boolean,
-    val port: Int,
-    val keyCount: Int,
-    val discoveryReady: Boolean = false,
-    val startedAt: Long = 0L,
-    val activeConns: Int = 0,
-    val totalSigns: Int = 0,
-    val lastSignAt: Long = 0L,
-    val lastSignKey: String = "",
-    val identitiesCalls: Int = 0,
-)
-
-// ---------------------------------------------------------------- 根界面
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -142,7 +110,6 @@ fun App(activity: Activity) {
 
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var keys by remember { mutableStateOf<List<KeyVm>>(emptyList()) }
-    var status by remember { mutableStateOf(SvcStatus(false, false, 0, 0)) }
     var logs by remember { mutableStateOf<List<String>>(emptyList()) }
     var busy by remember { mutableStateOf(false) }
 
@@ -152,21 +119,9 @@ fun App(activity: Activity) {
             keys = SshKeyVault.listEntries(app).map {
                 KeyVm(it.id, it.comment, it.fingerprint(), it.pubLine)
             }
+            // 公钥索引给 root agent 读
+            SshKeyVault.writePublicIndex(app)
         }
-        status = SvcStatus(
-            running = AgentService.tcpReady,
-            tcpEnabled = AgentService.tcpEnabled(app),
-            port = if (AgentService.tcpPortBound > 0) AgentService.tcpPortBound
-            else AgentService.tcpPort(app),
-            keyCount = keys.size,
-            discoveryReady = AgentService.discoveryReady,
-            startedAt = AgentService.startedAt,
-            activeConns = AgentService.activeConns,
-            totalSigns = AgentService.totalSigns,
-            lastSignAt = AgentService.lastSignAt,
-            lastSignKey = AgentService.lastSignKey ?: "",
-            identitiesCalls = AgentService.identitiesCalls,
-        )
         logs = AgentLog.snapshot()
     }
 
@@ -177,51 +132,16 @@ fun App(activity: Activity) {
             } catch (t: Throwable) {
                 AgentLog.add("UI", "refresh failed: $t")
             }
-            delay(800)
+            delay(1000)
         }
     }
 
-    fun toast(s: String) {
-        Toast.makeText(activity, s, Toast.LENGTH_SHORT).show()
-    }
+    fun toast(s: String) = Toast.makeText(activity, s, Toast.LENGTH_SHORT).show()
 
     fun copyPublic(key: KeyVm) {
         val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         cm.setPrimaryClip(ClipData.newPlainText("ssh public key", key.pubLine))
         toast("公钥已复制")
-        AgentLog.add("UI", "copied public key of ${key.comment.ifEmpty { key.id }}")
-    }
-
-    fun startAgent() {
-        scope.launch {
-            // 已经在跑就重启，让端口/配置变更立即生效
-            if (AgentService.tcpReady) {
-                activity.stopService(android.content.Intent(activity, AgentService::class.java))
-                AgentLog.add("UI", "重启: 已请求停止旧实例")
-                // 等旧实例真的释放端口，避免新实例 bind 撞车
-                for (i in 0 until 12) {
-                    delay(120)
-                    if (!AgentService.tcpReady) break
-                }
-            }
-            AgentService.start(activity)
-            AgentLog.add("UI", "启动请求已发送，等待端口就绪…")
-
-            // 最多等 3 秒，拿到真实结果再反馈，而不是只说"已请求"
-            var result = "超时：3 秒内没等到 TCP 监听"
-            val t0 = System.currentTimeMillis()
-            for (i in 0 until 15) {
-                delay(200)
-                if (AgentService.tcpReady) {
-                    val ms = System.currentTimeMillis() - t0
-                    result = "已就绪 ${ms}ms: TCP " + AgentService.tcpPortBound
-                    break
-                }
-            }
-            AgentLog.add("UI", result)
-            toast(result)
-            refresh()
-        }
     }
 
     fun generate(comment: String) {
@@ -234,8 +154,9 @@ fun App(activity: Activity) {
                 }
                 val pubBlob = SshKeyVault.unb64(res.publicLine.split(" ")[1])
                 val ok = saveKey(activity, res.privatePem, res.publicLine, pubBlob, comment)
-                AgentLog.add("UI", if (ok) "已生成并保存 $comment (${res.algo})" else "生成取消")
+                AgentLog.add("UI", if (ok) "已生成 $comment (${res.algo})" else "生成取消")
                 if (ok) toast("已保存 $comment")
+                if (ok) refresh()
             } catch (t: Throwable) {
                 AgentLog.add("UI", "generate failed: $t")
                 toast("生成失败: ${t.message}")
@@ -259,13 +180,14 @@ fun App(activity: Activity) {
                 val (blob, comment, pubLine) = parsed
                 val exists = withContext(Dispatchers.IO) { SshKeyVault.findByBlob(ctx, blob) != null }
                 if (exists) {
-                    AgentLog.add("UI", "导入跳过：这把公钥已存在")
+                    AgentLog.add("UI", "导入跳过：公钥已存在")
                     toast("这把钥匙已经导入过了")
                     return@launch
                 }
                 val ok = saveKey(activity, pem, pubLine, blob, comment)
                 AgentLog.add("UI", if (ok) "已导入 $comment" else "导入取消")
                 if (ok) toast("已导入 $comment")
+                if (ok) refresh()
             } catch (t: Throwable) {
                 AgentLog.add("UI", "import failed: $t")
                 toast("导入失败: ${t.message}")
@@ -287,12 +209,7 @@ fun App(activity: Activity) {
     Scaffold(
         topBar = {
             CenterAlignedTopAppBar(
-                title = {
-                    Text(
-                        "KeystoreSSH",
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                }
+                title = { Text("KeystoreSSH", fontWeight = FontWeight.SemiBold) }
             )
         },
         bottomBar = {
@@ -315,23 +232,12 @@ fun App(activity: Activity) {
         when (tab) {
             0 -> KeysScreen(
                 modifier = Modifier.padding(padding),
-                status = status,
                 keys = keys,
                 busy = busy,
-                onStart = ::startAgent,
                 onGenerate = ::generate,
                 onImport = ::import,
                 onCopy = ::copyPublic,
                 onDelete = ::delete,
-                onTcpSave = { enabled, port ->
-                    activity.getSharedPreferences(AgentService.PREF, Context.MODE_PRIVATE)
-                        .edit()
-                        .putBoolean(AgentService.PREF_TCP_ENABLED, enabled)
-                        .putInt(AgentService.PREF_TCP_PORT, port)
-                        .apply()
-                    AgentLog.add("UI", "TCP 设置: ${if (enabled) "开" else "关"} 端口 $port（重启 agent 生效）")
-                    toast("已保存，重启 agent 生效")
-                },
             )
             else -> LogsScreen(modifier = Modifier.padding(padding), logs = logs)
         }
@@ -343,19 +249,15 @@ fun App(activity: Activity) {
 @Composable
 private fun KeysScreen(
     modifier: Modifier,
-    status: SvcStatus,
     keys: List<KeyVm>,
     busy: Boolean,
-    onStart: () -> Unit,
     onGenerate: (String) -> Unit,
     onImport: (String) -> Unit,
     onCopy: (KeyVm) -> Unit,
     onDelete: (KeyVm) -> Unit,
-    onTcpSave: (Boolean, Int) -> Unit,
 ) {
     var showGen by remember { mutableStateOf(false) }
     var showImp by remember { mutableStateOf(false) }
-    var showTcp by remember { mutableStateOf(false) }
     var pendingDelete by remember { mutableStateOf<KeyVm?>(null) }
 
     LazyColumn(
@@ -363,7 +265,23 @@ private fun KeysScreen(
         contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        item { StatusCard(status, onStart = onStart, onTcp = { showTcp = true }) }
+        item {
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(18.dp)) {
+                    Text(
+                        "私钥由本机 Keystore 保护，签名时需指纹。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "局域网 agent 在 root 侧运行，通过系统调用本页的签名通道。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
 
         item {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -390,12 +308,12 @@ private fun KeysScreen(
 
         if (keys.isEmpty()) {
             item {
-                Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors()) {
+                Card(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(20.dp)) {
                         Text("还没有密钥", style = MaterialTheme.typography.titleMedium)
                         Spacer(Modifier.height(4.dp))
                         Text(
-                            "生成一把新密钥，或从电脑粘贴已有的 OpenSSH 私钥导入。",
+                            "生成一把新密钥，或粘贴已有的 OpenSSH Ed25519 私钥导入。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -405,35 +323,17 @@ private fun KeysScreen(
         }
 
         items(keys, key = { it.id }) { key ->
-            KeyCard(
-                key = key,
-                onCopy = { onCopy(key) },
-                onDelete = { pendingDelete = key },
-            )
+            KeyCard(key = key, onCopy = { onCopy(key) }, onDelete = { pendingDelete = key })
         }
 
         item { Spacer(Modifier.height(24.dp)) }
     }
 
     if (showGen) {
-        GenerateDialog(
-            onDismiss = { showGen = false },
-            onConfirm = { c -> showGen = false; onGenerate(c) },
-        )
+        GenerateDialog({ showGen = false }) { c -> showGen = false; onGenerate(c) }
     }
     if (showImp) {
-        ImportDialog(
-            onDismiss = { showImp = false },
-            onConfirm = { pem -> showImp = false; onImport(pem) },
-        )
-    }
-    if (showTcp) {
-        TcpDialog(
-            initialEnabled = status.tcpEnabled,
-            initialPort = status.port,
-            onDismiss = { showTcp = false },
-            onConfirm = { e, p -> showTcp = false; onTcpSave(e, p) },
-        )
+        ImportDialog({ showImp = false }) { pem -> showImp = false; onImport(pem) }
     }
     pendingDelete?.let { k ->
         AlertDialog(
@@ -443,96 +343,8 @@ private fun KeysScreen(
             confirmButton = {
                 TextButton(onClick = { pendingDelete = null; onDelete(k) }) { Text("删除") }
             },
-            dismissButton = {
-                TextButton(onClick = { pendingDelete = null }) { Text("取消") }
-            },
+            dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("取消") } },
         )
-    }
-}
-
-@Composable
-private fun StatusCard(status: SvcStatus, onStart: () -> Unit, onTcp: () -> Unit) {
-    val running = status.running
-    val dotColor = if (running) Color(0xFF4CAF50) else MaterialTheme.colorScheme.outline
-    val subColor = MaterialTheme.colorScheme.onSurfaceVariant
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(20.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(Modifier.size(10.dp).background(dotColor, CircleShape))
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    if (running) "SSH Agent 运行中" else "SSH Agent 未运行",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                )
-                if (running) {
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        "已运行 " + fmtUptime(status.startedAt),
-                        fontSize = 11.sp,
-                        color = subColor,
-                    )
-                }
-            }
-            Spacer(Modifier.height(10.dp))
-            Mono(
-                "tcp       " + when {
-                    status.running -> "0.0.0.0:${status.port}  ✓"
-                    status.tcpEnabled -> "端口 ${status.port} 未监听"
-                    else -> "未启用"
-                }
-            )
-            Mono("discover  udp:" + AgentService.DISCOVERY_PORT + if (status.discoveryReady) "  ✓ 可被发现" else "  —")
-            Mono("lan       " + lanIp() + ":" + status.port)
-            Mono("keys      ${status.keyCount} 把")
-            Mono("conns     ${status.activeConns} 活跃 · identities ${status.identitiesCalls} 次")
-            Mono(
-                "signs     ${status.totalSigns} 次" +
-                        if (status.lastSignAt > 0) " · 最近 ${fmtTime(status.lastSignAt)} ${status.lastSignKey}" else ""
-            )
-            Spacer(Modifier.height(12.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = onStart) {
-                    Icon(Icons.Filled.PlayArrow, null, Modifier.size(18.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text(if (running) "重启服务" else "启动服务")
-                }
-                FilledTonalButton(onClick = onTcp) {
-                    Icon(Icons.Filled.Settings, null, Modifier.size(18.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text("局域网")
-                }
-            }
-        }
-    }
-}
-
-/** 本机局域网 IPv4，用来告诉用户在电脑上连哪个地址 */
-private fun lanIp(): String = try {
-    java.util.Collections.list(java.net.NetworkInterface.getNetworkInterfaces())
-        .filter { it.isUp && !it.isLoopback }
-        .flatMap { it.interfaceAddresses }
-        .mapNotNull { it.address }
-        .firstOrNull { it is java.net.Inet4Address && it.isSiteLocalAddress }
-        ?.hostAddress ?: "?"
-} catch (t: Throwable) {
-    "?"
-}
-
-private fun fmtTime(ts: Long): String =
-    if (ts <= 0) "—"
-    else java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date(ts))
-
-private fun fmtUptime(startedAt: Long): String {
-    if (startedAt <= 0) return "—"
-    val s = (System.currentTimeMillis() - startedAt) / 1000
-    val h = s / 3600
-    val m = (s % 3600) / 60
-    val sec = s % 60
-    return when {
-        h > 0 -> "${h}h${m}m"
-        m > 0 -> "${m}m${sec}s"
-        else -> "${sec}s"
     }
 }
 
@@ -541,12 +353,8 @@ private fun KeyCard(key: KeyVm, onCopy: () -> Unit, onDelete: () -> Unit) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(18.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(
-                    Icons.Filled.Key,
-                    null,
-                    Modifier.size(20.dp),
-                    tint = MaterialTheme.colorScheme.primary,
-                )
+                Icon(Icons.Filled.Key, null, Modifier.size(20.dp),
+                    tint = MaterialTheme.colorScheme.primary)
                 Spacer(Modifier.width(8.dp))
                 Text(
                     key.comment.ifEmpty { "(无 comment)" },
@@ -555,7 +363,12 @@ private fun KeyCard(key: KeyVm, onCopy: () -> Unit, onDelete: () -> Unit) {
                 )
             }
             Spacer(Modifier.height(6.dp))
-            Mono(key.fingerprint)
+            Text(
+                key.fingerprint,
+                fontSize = 12.sp,
+                fontFamily = FontFamily.Monospace,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             Spacer(Modifier.height(4.dp))
             SelectionContainer {
                 Text(
@@ -573,10 +386,8 @@ private fun KeyCard(key: KeyVm, onCopy: () -> Unit, onDelete: () -> Unit) {
                     Text("复制公钥")
                 }
                 TextButton(onClick = onDelete) {
-                    Icon(
-                        Icons.Filled.Delete, null, Modifier.size(16.dp),
-                        tint = MaterialTheme.colorScheme.error,
-                    )
+                    Icon(Icons.Filled.Delete, null, Modifier.size(16.dp),
+                        tint = MaterialTheme.colorScheme.error)
                     Spacer(Modifier.width(4.dp))
                     Text("删除", color = MaterialTheme.colorScheme.error)
                 }
@@ -648,9 +459,7 @@ private fun GenerateDialog(onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
             }
         },
         confirmButton = {
-            TextButton(onClick = { onConfirm(comment.trim().ifEmpty { "android" }) }) {
-                Text("生成")
-            }
+            TextButton(onClick = { onConfirm(comment.trim().ifEmpty { "android" }) }) { Text("生成") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )
@@ -686,60 +495,7 @@ private fun ImportDialog(onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
     )
 }
 
-@Composable
-private fun TcpDialog(
-    initialEnabled: Boolean,
-    initialPort: Int,
-    onDismiss: () -> Unit,
-    onConfirm: (Boolean, Int) -> Unit,
-) {
-    var enabled by remember { mutableStateOf(initialEnabled) }
-    var port by remember { mutableStateOf(initialPort.toString()) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("局域网访问") },
-        text = {
-            Column {
-                Text(
-                    "开启后，同一局域网的电脑可以直接连这台手机的 agent。每次签名都要手机指纹，不需要白名单。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Spacer(Modifier.height(12.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("启用 TCP", modifier = Modifier.weight(1f))
-                    Switch(checked = enabled, onCheckedChange = { enabled = it })
-                }
-                OutlinedTextField(
-                    value = port,
-                    onValueChange = { port = it.filter(Char::isDigit) },
-                    label = { Text("端口 (1024-65535)") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = {
-                val p = port.toIntOrNull()
-                if (p != null && p in 1024..65535) onConfirm(enabled, p)
-            }) { Text("保存") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
-    )
-}
-
 // ---------------------------------------------------------------- 工具
-
-@Composable
-private fun Mono(text: String) {
-    Text(
-        text,
-        fontSize = 12.sp,
-        fontFamily = FontFamily.Monospace,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-    )
-}
 
 /** 指纹认证 → 返回已授权的 Cipher；取消/失败返回 null */
 private suspend fun awaitBiometric(activity: Activity, title: String, cipher: Cipher): Cipher? =
@@ -796,6 +552,7 @@ private suspend fun saveKey(
         withContext(Dispatchers.IO) {
             val sealed = SshKeyVault.seal(cipher, pem.toByteArray(Charsets.UTF_8))
             SshKeyVault.addEntry(activity, comment, pubLine, pubBlob, sealed)
+            SshKeyVault.writePublicIndex(activity)
             AgentLog.add("UI", "已加密保存 $comment (${sealed.totalBytes()}B)")
         }
         true

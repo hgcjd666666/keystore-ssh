@@ -59,9 +59,9 @@ public class SignActivity extends Activity {
         Intent i = getIntent();
         String keyB64 = i.getStringExtra("key");
         String dataB64 = i.getStringExtra("data");
-        String host = i.getStringExtra("host");
-        int port = i.getIntExtra("port", 0);
-        if (host == null) host = "127.0.0.1";
+        String hostRaw = i.getStringExtra("host");
+        final String host = hostRaw == null ? "127.0.0.1" : hostRaw;
+        final int port = i.getIntExtra("port", 0);
 
         if (keyB64 == null || dataB64 == null || port <= 0) {
             reply("ERR bad request (key/data/port missing)");
