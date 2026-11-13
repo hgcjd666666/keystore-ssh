@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    android:sharedUserId="com.dsh.sshvault">
+
+    <application
+        android:label="SSH Vault Generator"
+        android:allowBackup="false"
+        android:theme="@android:style/Theme.DeviceDefault">
+        <!-- 无 LAUNCHER intent-filter => 桌面不显示图标；exported=false => 只有同 UID 的 B 能拉起 -->
+        <activity
+            android:name=".GenerateActivity"
+            android:exported="true" />
+    </application>
+</manifest>
