@@ -51,9 +51,8 @@
 
     <!-- 签名活动 -->
     <string name="sign_title">SSH认证请求</string>
-    <string name="sign_desc_peer">%1$s 请求使用 %2$s 证书连接</string>
-    <string name="sign_desc_peer_server">%1$s 请求使用 %2$s 证书连接到 %3$s 服务器</string>
-    <string name="sign_subtitle">验证指纹后才会用这把私钥签名</string>
-    <string name="sign_description">私钥不离开本机，签名完成即清除</string>
+    <string name="sign_subtitle_fmt">%1$s 请求使用证书%2$s</string>
+    <string name="sign_desc_server_fp">服务器指纹 %1$s</string>
+    <string name="sign_refused_server">已拒绝：无法确认服务器身份</string>
     <string name="sign_deny">拒绝</string>
 </resources>

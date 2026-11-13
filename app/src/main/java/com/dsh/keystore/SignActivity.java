@@ -100,14 +100,55 @@ public class SignActivity extends Activity {
 
         // 请求方 IP 来自 TCP 连接的对端地址（agent 在 accept 时取的），PC 伪造不了
         String peer = getIntent().getStringExtra("peer");
-        String desc = (peer != null && !peer.isEmpty())
-                ? getString(R.string.sign_desc_peer, peer, entry.label())
-                : getString(R.string.sign_description);
+        // 服务器 host key 来自 session-bind，附带服务器对 session_id 的签名。
+        // 必须验签通过才算"可信来源"——否则 PC 可以随便伪造 hostkey 骗显示。
+        String hostkeyB64 = getIntent().getStringExtra("hostkey");
+        String sidB64 = getIntent().getStringExtra("session_id");
+        String sigB64 = getIntent().getStringExtra("bind_sig");
+        String hostFp = hostKeyFingerprint(hostkeyB64);
+        boolean hostVerified = false;
+        byte[] hostkeyBytes = null;
+        if (hostkeyB64 != null && !hostkeyB64.isEmpty()
+                && sidB64 != null && !sidB64.isEmpty()
+                && sigB64 != null && !sigB64.isEmpty()) {
+            try {
+                hostkeyBytes = Base64.getDecoder().decode(hostkeyB64);
+                hostVerified = verifyBind(
+                        hostkeyBytes,
+                        Base64.getDecoder().decode(sidB64),
+                        Base64.getDecoder().decode(sigB64));
+            } catch (Throwable t) {
+                AgentLog.add("Sign", "bind 验签异常: " + t);
+            }
+        }
+        AgentLog.add("Sign", "hostkey_fp=" + hostFp + " bind_verified=" + hostVerified);
 
-        BiometricPrompt prompt = new BiometricPrompt.Builder(this)
+        // 第二道检查：签名数据里嵌的 hostkey（hostbound USERAUTH_REQUEST）必须与 session-bind 一致，
+        // 否则就是"拿真实服务器的绑定、签攻击者服务器的数据"混合攻击
+        byte[] dataHostkey = extractHostkey(data);
+        boolean dataMatches = dataHostkey != null && hostkeyBytes != null
+                && java.util.Arrays.equals(dataHostkey, hostkeyBytes);
+        AgentLog.add("Sign", "data_hostkey_match=" + dataMatches);
+
+        if (!hostVerified || !dataMatches) {
+            // fail closed：确认不了服务器身份就不签
+            reply("ERR " + getString(R.string.sign_refused_server));
+            finish();
+            return;
+        }
+
+        // subtitle：谁在请求、用哪把证书；description：服务器 hostkey 指纹（验签通过的）
+        String serverFp = (hostFp != null) ? hostFp : "null";
+        String subtitle = (peer != null && !peer.isEmpty())
+                ? getString(R.string.sign_subtitle_fmt, peer, entry.label())
+                : null;
+        String desc = getString(R.string.sign_desc_server_fp, serverFp);
+
+        BiometricPrompt.Builder pb = new BiometricPrompt.Builder(this)
                 .setTitle(getString(R.string.sign_title))
-                .setSubtitle(getString(R.string.sign_subtitle))
-                .setDescription(desc)
+                .setDescription(desc);
+        if (subtitle != null) pb.setSubtitle(subtitle);
+        BiometricPrompt prompt = pb
                 .setNegativeButton(getString(R.string.sign_deny), ex, (d, w) -> {
                     reply("ERR user denied");
                     finish();
@@ -137,6 +178,87 @@ public class SignActivity extends Activity {
                         // 等用户重试
                     }
                 });
+    }
+
+    /**
+     * 从签名数据（hostbound 的 SSH2_MSG_USERAUTH_REQUEST）里抽出服务器 hostkey。
+     * 结构：string session_id | byte 0x32 | string user | string service |
+     *       string method | byte sig_follows | string pkalg | string key_blob | [string hostkey]
+     */
+    private static byte[] extractHostkey(byte[] data) {
+        try {
+            SshAgentProtocol.Reader r = new SshAgentProtocol.Reader(data, 0);
+            r.string();   // session id
+            r.u8();       // SSH2_MSG_USERAUTH_REQUEST
+            r.string();   // user
+            r.string();   // service
+            String method = new String(r.string(), StandardCharsets.US_ASCII);
+            r.u8();       // sig follows
+            r.string();   // pkalg
+            r.string();   // public key blob
+            if ("publickey-hostbound-v00@openssh.com".equals(method)) {
+                return r.string();   // hostkey
+            }
+            return null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * 用服务器 host key 验证 session-bind 里的签名，确认 hostkey 真的来自服务器。
+     * Ed25519 走 BouncyCastle，RSA 走 JCA。
+     */
+    private static boolean verifyBind(byte[] hostkeyBlob, byte[] sessionId, byte[] sigBlob) {
+        try {
+            SshAgentProtocol.Reader hr = new SshAgentProtocol.Reader(hostkeyBlob, 0);
+            String keyType = new String(hr.string(), StandardCharsets.US_ASCII);
+            SshAgentProtocol.Reader sr = new SshAgentProtocol.Reader(sigBlob, 0);
+            String sigAlg = new String(sr.string(), StandardCharsets.US_ASCII);
+            byte[] sig = sr.string();
+
+            if (SshAgentProtocol.ED25519.equals(keyType)) {
+                byte[] pub = hr.string();
+                org.bouncycastle.crypto.params.Ed25519PublicKeyParameters pk =
+                        new org.bouncycastle.crypto.params.Ed25519PublicKeyParameters(pub, 0);
+                org.bouncycastle.crypto.signers.Ed25519Signer ver =
+                        new org.bouncycastle.crypto.signers.Ed25519Signer();
+                ver.init(false, pk);
+                ver.update(sessionId, 0, sessionId.length);
+                return ver.verifySignature(sig);
+            }
+
+            if (keyType.startsWith("ssh-rsa") || keyType.startsWith("rsa-sha2")) {
+                java.math.BigInteger exp = new java.math.BigInteger(1, hr.string());
+                java.math.BigInteger mod = new java.math.BigInteger(1, hr.string());
+                java.security.PublicKey rsa = java.security.KeyFactory.getInstance("RSA")
+                        .generatePublic(new java.security.spec.RSAPublicKeySpec(mod, exp));
+                String jca = sigAlg.contains("512") ? "SHA512withRSA"
+                        : sigAlg.contains("256") ? "SHA256withRSA" : "SHA1withRSA";
+                java.security.Signature v = java.security.Signature.getInstance(jca);
+                v.initVerify(rsa);
+                v.update(sessionId);
+                return v.verify(sig);
+            }
+            AgentLog.add("Sign", "unsupported hostkey type: " + keyType);
+            return false;
+        } catch (Throwable t) {
+            AgentLog.add("Sign", "verifyBind failed: " + t);
+            return false;
+        }
+    }
+
+    /** 服务器 host key 的 SHA256 指纹（OpenSSH 风格） */
+    private static String hostKeyFingerprint(String b64) {
+        if (b64 == null || b64.isEmpty()) return null;
+        try {
+            byte[] blob = Base64.getDecoder().decode(b64);
+            byte[] d = java.security.MessageDigest.getInstance("SHA-256").digest(blob);
+            String s = Base64.getEncoder().withoutPadding().encodeToString(d);
+            return "SHA256:" + s.replace('+', '-').replace('/', '_');
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     private int canAuthenticate() {
