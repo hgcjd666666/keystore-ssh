@@ -59,6 +59,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -139,7 +140,7 @@ fun App(activity: Activity) {
     fun copyPublic(key: KeyVm) {
         val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         cm.setPrimaryClip(ClipData.newPlainText("ssh public key", key.pubLine))
-        toast("公钥已复制")
+        toast(activity.getString(R.string.toast_pub_copied))
     }
 
     fun generate(comment: String) {
@@ -153,11 +154,11 @@ fun App(activity: Activity) {
                 val pubBlob = SshKeyVault.unb64(res.publicLine.split(" ")[1])
                 val ok = saveKey(activity, res.privatePem, res.publicLine, pubBlob, comment)
                 AgentLog.add("UI", if (ok) "已生成 $comment (${res.algo})" else "生成取消")
-                if (ok) toast("已保存 $comment")
+                if (ok) toast(activity.getString(R.string.toast_saved, comment))
                 if (ok) refresh()
             } catch (t: Throwable) {
                 AgentLog.add("UI", "generate failed: $t")
-                toast("生成失败: ${t.message}")
+                toast(activity.getString(R.string.toast_generate_failed, t.message))
             } finally {
                 busy = false
             }
@@ -179,16 +180,16 @@ fun App(activity: Activity) {
                 val exists = withContext(Dispatchers.IO) { SshKeyVault.findByBlob(ctx, blob) != null }
                 if (exists) {
                     AgentLog.add("UI", "导入跳过：公钥已存在")
-                    toast("这把钥匙已经导入过了")
+                    toast(activity.getString(R.string.toast_import_exists))
                     return@launch
                 }
                 val ok = saveKey(activity, pem, pubLine, blob, comment)
                 AgentLog.add("UI", if (ok) "已导入 $comment" else "导入取消")
-                if (ok) toast("已导入 $comment")
+                if (ok) toast(activity.getString(R.string.toast_imported, comment))
                 if (ok) refresh()
             } catch (t: Throwable) {
                 AgentLog.add("UI", "import failed: $t")
-                toast("导入失败: ${t.message}")
+                toast(activity.getString(R.string.toast_import_failed, t.message))
             } finally {
                 busy = false
             }
@@ -199,7 +200,7 @@ fun App(activity: Activity) {
         scope.launch {
             withContext(Dispatchers.IO) { SshKeyVault.removeEntry(ctx, key.id) }
             AgentLog.add("UI", "已删除 ${key.comment.ifEmpty { key.id }}")
-            toast("已删除")
+            toast(activity.getString(R.string.toast_deleted))
             refresh()
         }
     }
@@ -207,7 +208,7 @@ fun App(activity: Activity) {
     Scaffold(
         topBar = {
             CenterAlignedTopAppBar(
-                title = { Text("KeystoreSSH", fontWeight = FontWeight.SemiBold) }
+                title = { Text(stringResource(R.string.app_name), fontWeight = FontWeight.SemiBold) }
             )
         },
         bottomBar = {
@@ -216,13 +217,13 @@ fun App(activity: Activity) {
                     selected = tab == 0,
                     onClick = { tab = 0 },
                     icon = { Icon(Icons.Filled.Key, null) },
-                    label = { Text("密钥") },
+                    label = { Text(stringResource(R.string.tab_keys)) },
                 )
                 NavigationBarItem(
                     selected = tab == 1,
                     onClick = { tab = 1 },
                     icon = { Icon(Icons.Filled.Terminal, null) },
-                    label = { Text("日志") },
+                    label = { Text(stringResource(R.string.tab_logs)) },
                 )
             }
         },
@@ -267,13 +268,13 @@ private fun KeysScreen(
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(18.dp)) {
                     Text(
-                        "私钥由本机 Keystore 保护，签名时需指纹。",
+                        stringResource(R.string.keys_hint_1),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "局域网 agent 在 root 侧运行，通过系统调用本页的签名通道。",
+                        stringResource(R.string.keys_hint_2),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -290,7 +291,7 @@ private fun KeysScreen(
                 ) {
                     Icon(Icons.Filled.Add, null, Modifier.size(18.dp))
                     Spacer(Modifier.width(6.dp))
-                    Text("生成密钥")
+                    Text(stringResource(R.string.action_generate))
                 }
                 FilledTonalButton(
                     onClick = { showImp = true },
@@ -308,10 +309,10 @@ private fun KeysScreen(
             item {
                 Card(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(20.dp)) {
-                        Text("还没有密钥", style = MaterialTheme.typography.titleMedium)
+                        Text(stringResource(R.string.keys_empty_title), style = MaterialTheme.typography.titleMedium)
                         Spacer(Modifier.height(4.dp))
                         Text(
-                            "生成一把新密钥，或粘贴已有的 OpenSSH Ed25519 私钥导入。",
+                            stringResource(R.string.keys_empty_hint),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -336,18 +337,19 @@ private fun KeysScreen(
     pendingDelete?.let { k ->
         AlertDialog(
             onDismissRequest = { pendingDelete = null },
-            title = { Text("删除密钥 ${k.comment.ifEmpty { k.id }}？") },
-            text = { Text("删除后这把钥匙的密文随之消失，无法恢复。") },
+            title = { Text(stringResource(R.string.dialog_delete_title, k.comment.ifEmpty { k.id })) },
+            text = { Text(stringResource(R.string.dialog_delete_message)) },
             confirmButton = {
                 TextButton(onClick = { pendingDelete = null; onDelete(k) }) { Text("删除") }
             },
-            dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("取消") } },
+            dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text(stringResource(R.string.action_cancel)) } },
         )
     }
 }
 
 @Composable
 private fun KeyCard(key: KeyVm, onCopy: () -> Unit, onDelete: () -> Unit) {
+    val noComment = stringResource(R.string.no_comment)
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(18.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -355,7 +357,7 @@ private fun KeyCard(key: KeyVm, onCopy: () -> Unit, onDelete: () -> Unit) {
                     tint = MaterialTheme.colorScheme.primary)
                 Spacer(Modifier.width(8.dp))
                 Text(
-                    key.comment.ifEmpty { "(无 comment)" },
+                    key.comment.ifEmpty { noComment },
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold,
                 )
@@ -381,13 +383,13 @@ private fun KeyCard(key: KeyVm, onCopy: () -> Unit, onDelete: () -> Unit) {
                 TextButton(onClick = onCopy) {
                     Icon(Icons.Filled.ContentCopy, null, Modifier.size(16.dp))
                     Spacer(Modifier.width(4.dp))
-                    Text("复制公钥")
+                    Text(stringResource(R.string.action_copy_pub))
                 }
                 TextButton(onClick = onDelete) {
                     Icon(Icons.Filled.Delete, null, Modifier.size(16.dp),
                         tint = MaterialTheme.colorScheme.error)
                     Spacer(Modifier.width(4.dp))
-                    Text("删除", color = MaterialTheme.colorScheme.error)
+                    Text(stringResource(R.string.action_delete), color = MaterialTheme.colorScheme.error)
                 }
             }
         }
@@ -408,7 +410,7 @@ private fun LogsScreen(modifier: Modifier, logs: List<String>) {
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Text("暂无日志", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(stringResource(R.string.logs_empty), color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         return
     }
@@ -438,11 +440,11 @@ private fun GenerateDialog(onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
     var comment by remember { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("生成新密钥") },
+        title = { Text(stringResource(R.string.dialog_generate_title)) },
         text = {
             Column {
                 Text(
-                    "comment 用来在电脑端认出这把钥匙，例如 dsh。",
+                    stringResource(R.string.dialog_generate_hint),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -450,16 +452,16 @@ private fun GenerateDialog(onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
                 OutlinedTextField(
                     value = comment,
                     onValueChange = { comment = it },
-                    label = { Text("comment") },
+                    label = { Text(stringResource(R.string.label_comment)) },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
             }
         },
         confirmButton = {
-            TextButton(onClick = { onConfirm(comment.trim().ifEmpty { "android" }) }) { Text("生成") }
+            TextButton(onClick = { onConfirm(comment.trim().ifEmpty { "android" }) }) { Text(stringResource(R.string.action_generate_btn)) }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_cancel)) } },
     )
 }
 
@@ -468,11 +470,11 @@ private fun ImportDialog(onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
     var pem by remember { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("导入私钥") },
+        title = { Text(stringResource(R.string.dialog_import_title)) },
         text = {
             Column {
                 Text(
-                    "粘贴未加密的 OpenSSH Ed25519 私钥。导入后立刻用指纹加密存入 Keystore，明文不保留。",
+                    stringResource(R.string.dialog_import_hint),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -480,7 +482,7 @@ private fun ImportDialog(onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
                 OutlinedTextField(
                     value = pem,
                     onValueChange = { pem = it },
-                    label = { Text("-----BEGIN OPENSSH PRIVATE KEY-----") },
+                    label = { Text(stringResource(R.string.label_pem)) },
                     textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                     minLines = 6,
                     maxLines = 12,
@@ -488,8 +490,8 @@ private fun ImportDialog(onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
                 )
             }
         },
-        confirmButton = { TextButton(onClick = { onConfirm(pem.trim()) }) { Text("导入") } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+        confirmButton = { TextButton(onClick = { onConfirm(pem.trim()) }) { Text(stringResource(R.string.action_import_btn)) } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_cancel)) } },
     )
 }
 

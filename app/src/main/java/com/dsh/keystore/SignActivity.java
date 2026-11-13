@@ -98,10 +98,10 @@ public class SignActivity extends Activity {
 
         java.util.concurrent.Executor ex = getMainExecutor();
         BiometricPrompt prompt = new BiometricPrompt.Builder(this)
-                .setTitle("SSH 签名请求: " + entry.label())
-                .setSubtitle("验证指纹后才会用这把私钥签名")
-                .setDescription("私钥不离开本机，签名完成即清除")
-                .setNegativeButton("拒绝", ex, (d, w) -> {
+                .setTitle(getString(R.string.sign_title, entry.label()))
+                .setSubtitle(getString(R.string.sign_subtitle))
+                .setDescription(getString(R.string.sign_description))
+                .setNegativeButton(getString(R.string.sign_deny), ex, (d, w) -> {
                     reply("ERR user denied");
                     finish();
                 })
