@@ -47,21 +47,13 @@ build_agent() {
 build_module() {
     [ -x agent/ksv-agent ] || build_agent
 
-    local ver stage out apk
+    local ver stage out
     ver=$(sed -n 's/^version=//p' magisk/module.prop)
     stage="build/magisk-stage"
     rm -rf "$stage"
     mkdir -p "$stage/bin"
     cp -a magisk/. "$stage/"
     cp -f agent/ksv-agent "$stage/bin/ksv-agent"
-
-    # 有 release APK 就顺带打进去，装模块时一并装上；没有就只装 agent
-    apk="${APK:-app/build/outputs/apk/release/app-release.apk}"
-    if [ -f "$apk" ]; then
-        cp -f "$apk" "$stage/app.apk"
-    else
-        echo "!! 没有 release APK，模块只含 agent（不自动装 app）"
-    fi
 
     find "$stage" -type f -exec chmod 0644 {} +
     chmod 0755 "$stage/service.sh" "$stage/customize.sh" \
