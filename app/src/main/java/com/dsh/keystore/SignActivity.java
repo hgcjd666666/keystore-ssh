@@ -97,10 +97,17 @@ public class SignActivity extends Activity {
         }
 
         java.util.concurrent.Executor ex = getMainExecutor();
+
+        // 请求方 IP 来自 TCP 连接的对端地址（agent 在 accept 时取的），PC 伪造不了
+        String peer = getIntent().getStringExtra("peer");
+        String desc = (peer != null && !peer.isEmpty())
+                ? getString(R.string.sign_desc_peer, peer, entry.label())
+                : getString(R.string.sign_description);
+
         BiometricPrompt prompt = new BiometricPrompt.Builder(this)
-                .setTitle(getString(R.string.sign_title, entry.label()))
+                .setTitle(getString(R.string.sign_title))
                 .setSubtitle(getString(R.string.sign_subtitle))
-                .setDescription(getString(R.string.sign_description))
+                .setDescription(desc)
                 .setNegativeButton(getString(R.string.sign_deny), ex, (d, w) -> {
                     reply("ERR user denied");
                     finish();

@@ -21,35 +21,38 @@
 
     <!-- 空状态 -->
     <string name="keys_empty_title">还没有密钥</string>
-    <string name="keys_empty_hint">生成一把新密钥，或粘贴已有的 OpenSSH Ed25519 私钥导入。</string>
+    <string name="keys_empty_hint">生成一把新密钥，或粘贴已有的私钥导入。</string>
     <string name="logs_empty">暂无日志</string>
-    <string name="no_comment">(无 comment)</string>
+    <string name="no_comment">暂无描述</string>
 
     <!-- 生成对话框 -->
     <string name="dialog_generate_title">生成新密钥</string>
-    <string name="dialog_generate_hint">comment 用来在电脑端认出这把钥匙，例如 dsh。</string>
+    <string name="dialog_generate_hint">comment用来在电脑端认出这把key，可以是任意值</string>
     <string name="label_comment">comment</string>
 
     <!-- 导入对话框 -->
     <string name="dialog_import_title">导入私钥</string>
-    <string name="dialog_import_hint">粘贴未加密的 OpenSSH Ed25519 私钥。导入后立刻用指纹加密存入 Keystore，明文不保留。</string>
+    <string name="dialog_import_hint">粘贴未加密的 OpenSSH Ed25519 私钥。
+（仅支持OpenSSH Ed25519 私钥）</string>
     <string name="label_pem">-----BEGIN OPENSSH PRIVATE KEY-----</string>
 
     <!-- 删除确认 -->
     <string name="dialog_delete_title">删除密钥 %1$s？</string>
-    <string name="dialog_delete_message">删除后这把钥匙的密文随之消失，无法恢复。</string>
+    <string name="dialog_delete_message">删除后无法还原</string>
 
     <!-- Toast -->
     <string name="toast_pub_copied">公钥已复制</string>
     <string name="toast_saved">已保存 %1$s</string>
     <string name="toast_imported">已导入 %1$s</string>
-    <string name="toast_import_exists">这把钥匙已经导入过了</string>
+    <string name="toast_import_exists">key已存在</string>
     <string name="toast_deleted">已删除</string>
     <string name="toast_generate_failed">生成失败: %1$s</string>
     <string name="toast_import_failed">导入失败: %1$s</string>
 
     <!-- 签名活动 -->
-    <string name="sign_title">SSH 签名请求: %1$s</string>
+    <string name="sign_title">SSH认证请求</string>
+    <string name="sign_desc_peer">%1$s 请求使用 %2$s 证书连接</string>
+    <string name="sign_desc_peer_server">%1$s 请求使用 %2$s 证书连接到 %3$s 服务器</string>
     <string name="sign_subtitle">验证指纹后才会用这把私钥签名</string>
     <string name="sign_description">私钥不离开本机，签名完成即清除</string>
     <string name="sign_deny">拒绝</string>
