@@ -14,4 +14,3 @@ dependencyResolutionManagement {
 }
 rootProject.name = "KeystoreSSH"
 include ':app'
-include ':anchor'

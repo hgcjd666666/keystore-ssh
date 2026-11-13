@@ -16,3 +16,4 @@
 
 # C agent 编译产物
 /agent/ksv-agent
+/.kotlin
