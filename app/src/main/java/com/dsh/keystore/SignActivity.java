@@ -156,14 +156,23 @@ public class SignActivity extends Activity {
         }
     }
 
-    /** 把结果写回 root agent 的临时端口 */
+    /** 把结果写回 root agent 的临时端口（网络操作不能在主线程，切后台，写完再 finish） */
     private void reply(String line) {
+        final String l = line;
+        Intent i = getIntent();
+        String h = i == null ? null : i.getStringExtra("host");
+        final String host = h == null ? "127.0.0.1" : h;
+        final int port = i == null ? 0 : i.getIntExtra("port", 0);
+        new Thread(() -> {
+            sendReply(host, port, l);
+            runOnUiThread(this::finish);
+        }, "sign-reply").start();
+    }
+
+    private void sendReply(String host, int port, String line) {
         try {
-            String host = getIntent().getStringExtra("host");
-            int port = getIntent().getIntExtra("port", 0);
-            if (host == null) host = "127.0.0.1";
             if (port <= 0) {
-                AgentLog.add("Sign", "无回传端口，结果丢弃: " + line.substring(0, Math.min(20, line.length())));
+                AgentLog.add("Sign", "无回传端口，结果丢弃");
                 return;
             }
             try (Socket s = new Socket(InetAddress.getByName(host), port)) {
