@@ -119,8 +119,6 @@ fun App(activity: Activity) {
             keys = SshKeyVault.listEntries(app).map {
                 KeyVm(it.id, it.comment, it.fingerprint(), it.pubLine)
             }
-            // 公钥索引给 root agent 读
-            SshKeyVault.writePublicIndex(app)
         }
         logs = AgentLog.snapshot()
     }
@@ -552,7 +550,6 @@ private suspend fun saveKey(
         withContext(Dispatchers.IO) {
             val sealed = SshKeyVault.seal(cipher, pem.toByteArray(Charsets.UTF_8))
             SshKeyVault.addEntry(activity, comment, pubLine, pubBlob, sealed)
-            SshKeyVault.writePublicIndex(activity)
             AgentLog.add("UI", "已加密保存 $comment (${sealed.totalBytes()}B)")
         }
         true
