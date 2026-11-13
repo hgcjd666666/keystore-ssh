@@ -56,7 +56,7 @@ build_module() {
     cp -f agent/ksv-agent "$stage/bin/ksv-agent"
 
     # 有 release APK 就顺带打进去，装模块时一并装上；没有就只装 agent
-    apk="app/build/outputs/apk/release/app-release.apk"
+    apk="${APK:-app/build/outputs/apk/release/app-release.apk}"
     if [ -f "$apk" ]; then
         cp -f "$apk" "$stage/app.apk"
     else
