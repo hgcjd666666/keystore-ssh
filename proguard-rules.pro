@@ -1,10 +1,9 @@
-# BouncyCastle：大量反射/服务发现，整体保留
--keep class org.bouncycastle.** { *; }
+# 只用 BC 的 Ed25519 实现，其余交给 R8 静态裁剪
+-keep class org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters { *; }
+-keep class org.bouncycastle.crypto.params.Ed25519PublicKeyParameters { *; }
+-keep class org.bouncycastle.crypto.signers.Ed25519Signer { *; }
 -dontwarn org.bouncycastle.**
 
-# org.json 结构反射
--keep class org.json.** { *; }
-
-# Compose 运行时由自带规则处理；这里只需保住 Activity/Service 入口
+# Activity 入口（manifest 已引用，R8 会保留，这里显式声明更稳）
 -keep class com.dsh.keystore.MainActivity { *; }
 -keep class com.dsh.keystore.SignActivity { *; }

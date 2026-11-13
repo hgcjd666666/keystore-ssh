@@ -14,6 +14,8 @@ android {
         targetSdk 35
         versionCode 1
         versionName '0.2'
+        resConfigs "zh", "en"
+        ndk { abiFilters "arm64-v8a" }
     }
 
     buildTypes {
@@ -40,17 +42,25 @@ android {
     buildFeatures {
         compose true
     }
+
+    // BouncyCastle 的 jar 里带了 PQC/Picnic 等算法数据（lowmc*.bin.properties 约 1.3MB），
+    // 我们只用 Ed25519，这些资源全部排掉
+    packaging {
+        resources {
+            excludes += [
+                "org/bouncycastle/pqc/**",
+                "org/bouncycastle/**/*.properties",
+            ]
+        }
+    }
 }
 
 dependencies {
     implementation platform('androidx.compose:compose-bom:2024.10.01')
     implementation 'androidx.compose.ui:ui'
-    implementation 'androidx.compose.ui:ui-graphics'
-    implementation 'androidx.compose.ui:ui-tooling-preview'
     implementation 'androidx.compose.material3:material3'
     implementation 'androidx.compose.material:material-icons-extended'
     implementation 'androidx.activity:activity-compose:1.9.3'
-    implementation 'androidx.lifecycle:lifecycle-runtime-compose:2.8.7'
 
     // Ed25519 密钥生成（Android 的 Conscrypt 不保证提供 Ed25519 KeyPairGenerator）
     implementation 'org.bouncycastle:bcprov-jdk18on:1.78.1'
