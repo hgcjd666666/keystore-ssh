@@ -1,3 +1,4 @@
+# Gradle / Android
 *.iml
 .gradle
 /local.properties
@@ -8,3 +9,10 @@
 /captures
 .externalNativeBuild
 .cxx
+
+# 构建产物
+*.apk
+*.aab
+
+# C agent 编译产物
+/agent/ksv-agent
