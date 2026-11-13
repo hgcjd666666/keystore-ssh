@@ -1,0 +1,6 @@
+id=keystore-ssh
+name=KeystoreSSH Agent
+version=v1.0
+versionCode=1
+author=dsh
+description=KeystoreSSH 的守护进程，开启端口暴露给电脑，把 SSH 请求转发给 KeystoreSSH 签名

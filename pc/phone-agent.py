@@ -22,11 +22,13 @@ phone-agent —— PC 侧守护程序，把手机上的 SSH agent 变成本地�
 环境变量 PHONE_AGENT_HOST / PHONE_AGENT_PORT / PHONE_AGENT_SOCK 可代替参数。
 """
 import argparse
+import atexit
 import base64
 import hashlib
 import json
 import os
 import socket
+import signal
 import struct
 import sys
 import threading
@@ -154,13 +156,47 @@ def sign_data(host: str, port: int, pub_blob: bytes, data: bytes) -> bytes:
 
 def cmd_serve(args):
     host, port, sock_path = args.host, args.port, args.sock
+    auto = host in ("", "auto")
+    phone = {"ip": None if auto else host, "port": port}
+    lock = threading.Lock()
+
+    def resolve(reprobe: bool = False):
+        """返回 (ip, port)。auto 模式下连不上就重新在局域网里找"""
+        if not auto:
+            return phone["ip"], phone["port"]
+        with lock:
+            if reprobe or not phone["ip"]:
+                found = probe(wait=max(1.0, args.wait), quiet=True)
+                if found:
+                    ip = sorted(found)[0]
+                    phone["ip"] = ip
+                    phone["port"] = int(found[ip].get("tcp") or port)
+                    print(f"[phone-agent] 发现手机 {ip}:{phone['port']} "
+                          f"{found[ip].get('name', '')}", flush=True)
+                elif reprobe:
+                    print("[phone-agent] 局域网里没找到手机", flush=True)
+            return phone["ip"], phone["port"]
+
     if os.path.exists(sock_path):
         os.unlink(sock_path)
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(sock_path)
     os.chmod(sock_path, 0o600)
     srv.listen(16)
-    print(f"[phone-agent] unix {sock_path} -> tcp {host}:{port}", flush=True)
+
+    def cleanup():
+        try:
+            os.unlink(sock_path)
+        except OSError:
+            pass
+
+    atexit.register(cleanup)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    print(f"[phone-agent] unix {sock_path} -> "
+          f"{'auto（局域网发现）' if auto else f'tcp {host}:{port}'}", flush=True)
+    if auto:
+        resolve()
 
     def pump(src: socket.socket, dst: socket.socket):
         try:
@@ -180,7 +216,18 @@ def cmd_serve(args):
     def handle(client: socket.socket):
         upstream = None
         try:
-            upstream = connect_phone(host, port, timeout=10.0)
+            for attempt in (0, 1):
+                ip, pt = resolve(reprobe=attempt > 0)
+                if not ip:
+                    continue
+                try:
+                    upstream = connect_phone(ip, pt, timeout=10.0)
+                    break
+                except OSError as e:
+                    print(f"[phone-agent] 连 {ip}:{pt} 失败: {e}", flush=True)
+                    phone["ip"] = None if auto else phone["ip"]
+            if upstream is None:
+                return
             upstream.settimeout(None)
             client.settimeout(None)
             t = threading.Thread(target=pump, args=(client, upstream), daemon=True)
@@ -296,8 +343,8 @@ def local_hosts():
     return hosts
 
 
-def cmd_discover(args):
-    """发现局域网里的手机 agent：广播 + 子网单播扫描双管齐下"""
+def probe(wait: float = 2.0, quiet: bool = False) -> dict:
+    """在局域网里找手机 agent：广播 + 子网单播扫描双管齐下。返回 {ip: info}"""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock.setblocking(False)
@@ -322,10 +369,11 @@ def cmd_discover(args):
     sock.setblocking(True)
     sock.settimeout(0.2)
 
-    print(f"已探测 {sent} 个地址（广播 + {len(hosts)} 个单播），等待 {args.wait:.1f}s…", file=sys.stderr)
+    if not quiet:
+        print(f"已探测 {sent} 个地址（广播 + {len(hosts)} 个单播），等待 {wait:.1f}s…", file=sys.stderr)
 
     found = {}
-    deadline = time.time() + args.wait
+    deadline = time.time() + wait
     while time.time() < deadline:
         try:
             data, addr = sock.recvfrom(1024)
@@ -339,7 +387,11 @@ def cmd_discover(args):
             continue
         found[addr[0]] = info
     sock.close()
+    return found
 
+
+def cmd_discover(args):
+    found = probe(wait=args.wait)
     if not found:
         print("没有发现手机 agent。(检查: 手机和电脑同一局域网 / App 里开了「局域网」/ 服务在跑)")
         return 1
@@ -372,9 +424,20 @@ def main():
                     help="discover 等待应答的秒数，默认 2")
     args = ap.parse_args()
 
-    if args.cmd in ("serve", "list", "export", "sign", "check") and not args.host:
+    if args.cmd in ("serve", "list", "export", "sign", "check") and not args.host \
+            and args.cmd != "serve":
         print("需要 --host（或 PHONE_AGENT_HOST 环境变量）", file=sys.stderr)
         return 2
+
+    # 非 serve 的单次命令：--host auto 就地探测一次
+    if args.host == "auto" and args.cmd != "serve":
+        found = probe(wait=args.wait, quiet=True)
+        if not found:
+            print("局域网里没找到手机 agent", file=sys.stderr)
+            return 1
+        ip = sorted(found)[0]
+        args.port = int(found[ip].get("tcp") or args.port)
+        args.host = ip
 
     if args.cmd == "export":
         args.comment = args.arg1

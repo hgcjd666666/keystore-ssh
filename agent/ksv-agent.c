@@ -10,6 +10,9 @@
 //
 // 编译：NDK clang -O2 -o ksv-agent ksv-agent.c
 // 运行：su -c "nohup /data/local/tmp/ksv-agent >/data/local/tmp/ksv-agent.log 2>&1 &"
+//
+// 作为 Magisk 模块启动时（/data/adb/modules/<id>/bin/ksv-agent），会用 inotify
+// 盯着模块目录：模块被卸载（目录消失）时立即自行退出，无需 uninstall.sh。
 
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -23,13 +26,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/inotify.h>
+#include <sys/system_properties.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <limits.h>
 #include <unistd.h>
 
 #define LISTEN_PORT      7022
+#define DISCOVERY_PORT   7023
+#define DISCOVER_PROBE   "KSV_DISCOVER"
 #define PREFS_PATH       "/data/data/com.dsh.keystore/shared_prefs/ssh_vault.xml"
 #define PUBKEYS_PATH     "/data/data/com.dsh.keystore/files/pubkeys.json"
 #define AM_PATH          "/system/bin/am"
@@ -592,6 +600,108 @@ static void handle_conn(int fd, const char *peer_ip) {
     free(ctx.bind_sig);
 }
 
+// ---------------------------------------------------------------- 模块存活监视
+
+// 本进程若位于 Magisk/KSU 模块目录（/data/adb/modules/<id>/...），返回一个
+// inotify fd 监听"模块目录被删除"；否则返回 -1（手动 /data/local/tmp 运行时不监视）。
+// out_id 带回模块 id。
+static int watch_module_dir(char *out_dir, size_t dlen, char *out_id, size_t idlen) {
+    char exe[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n <= 0) return -1;
+    exe[n] = '\0';
+
+    static const char base[] = "/data/adb/modules";
+    if (strncmp(exe, base, sizeof base - 1) != 0) return -1;
+
+    char *p = exe + sizeof base - 1;
+    if (strncmp(p, "_update", 7) == 0) p += 7;   // 装完还没重启时在 modules_update
+    if (*p != '/') return -1;
+
+    char *id = p + 1;
+    char *slash = strchr(id, '/');
+    if (!slash) return -1;              // 直接躺在 modules/ 下，不是模块
+    *slash = '\0';                      // exe 截断成模块目录
+    if (strlen(id) >= idlen) return -1;
+    snprintf(out_id, idlen, "%s", id);
+
+    if (strlen(exe) >= dlen) return -1;
+    snprintf(out_dir, dlen, "%s", exe);
+
+    char parent[PATH_MAX];
+    snprintf(parent, sizeof parent, "%s", exe);
+    char *ps = strrchr(parent, '/');
+    if (!ps) return -1;
+    *ps = '\0';
+
+    int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (fd < 0) return -1;
+
+    // 目录自身被删除 / 被移走
+    if (inotify_add_watch(fd, exe, IN_DELETE_SELF | IN_MOVE_SELF | IN_ONLYDIR) < 0) {
+        close(fd);
+        return -1;
+    }
+    // 父目录里 <id> 被删除（rm -rf 时先收到这一条）
+    if (inotify_add_watch(fd, parent, IN_DELETE) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+// 读空 inotify 队列；返回 1 表示模块目录已消失
+static int module_dir_gone(int fd, const char *id) {
+    char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
+    for (;;) {
+        ssize_t n = read(fd, buf, sizeof buf);
+        if (n <= 0) return 0;
+        for (char *p = buf; p < buf + n;) {
+            struct inotify_event *ev = (struct inotify_event *) p;
+            if (ev->mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED)) return 1;
+            if ((ev->mask & IN_DELETE) && ev->len > 0 && strcmp(ev->name, id) == 0) return 1;
+            p += sizeof(struct inotify_event) + ev->len;
+        }
+    }
+}
+
+// ---------------------------------------------------------------- UDP 发现
+
+// 局域网内 PC 发 KSV_DISCOVER 到 7023，这里回一个 JSON 告诉它端口和机型
+static int setup_discovery(void) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    int on = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_ANY);
+    sa.sin_port = htons(DISCOVERY_PORT);
+    if (bind(fd, (struct sockaddr *) &sa, sizeof sa) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void answer_discovery(int fd) {
+    char req[64];
+    struct sockaddr_in from;
+    socklen_t flen = sizeof from;
+    ssize_t n = recvfrom(fd, req, sizeof req - 1, 0, (struct sockaddr *) &from, &flen);
+    if (n <= 0) return;
+    req[n] = '\0';
+    if (strcmp(req, DISCOVER_PROBE) != 0) return;
+
+    char model[PROP_VALUE_MAX] = "";
+    __system_property_get("ro.product.model", model);
+    char resp[256];
+    snprintf(resp, sizeof resp, "{\"tcp\":%d,\"name\":\"%s\"}", LISTEN_PORT,
+             model[0] ? model : "android");
+    sendto(fd, resp, strlen(resp), 0, (struct sockaddr *) &from, flen);
+}
+
 int main(void) {
     signal(SIGCHLD, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
@@ -609,7 +719,50 @@ int main(void) {
     if (listen(lfd, 16) < 0) { perror("listen"); return 1; }
 
     logf("ksv-agent listening on 0.0.0.0:%d", LISTEN_PORT);
+
+    char mod_id[64] = "";
+    char mod_dir[PATH_MAX] = "";
+    int ifd = watch_module_dir(mod_dir, sizeof mod_dir, mod_id, sizeof mod_id);
+    if (ifd >= 0) logf("监视模块目录 %s（被删除时退出）", mod_dir);
+
+    int dfd = setup_discovery();
+    if (dfd >= 0) logf("UDP 发现在 %d 上待命", DISCOVERY_PORT);
+
     for (;;) {
+        struct pollfd pfd[3];
+        int nfds = 0;
+        int i_lfd = nfds++;
+        pfd[i_lfd].fd = lfd;
+        pfd[i_lfd].events = POLLIN;
+        pfd[i_lfd].revents = 0;
+        int i_ifd = -1, i_dfd = -1;
+        if (ifd >= 0) {
+            i_ifd = nfds++;
+            pfd[i_ifd].fd = ifd;
+            pfd[i_ifd].events = POLLIN;
+            pfd[i_ifd].revents = 0;
+        }
+        if (dfd >= 0) {
+            i_dfd = nfds++;
+            pfd[i_dfd].fd = dfd;
+            pfd[i_dfd].events = POLLIN;
+            pfd[i_dfd].revents = 0;
+        }
+
+        int pr = poll(pfd, nfds, -1);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            perror("poll");
+            break;
+        }
+
+        if (i_dfd >= 0 && (pfd[i_dfd].revents & POLLIN)) answer_discovery(dfd);
+        if (i_ifd >= 0 && (pfd[i_ifd].revents & POLLIN) && module_dir_gone(ifd, mod_id)) {
+            logf("模块 %s 已被移除，退出", mod_id);
+            break;
+        }
+        if (!(pfd[i_lfd].revents & POLLIN)) continue;
+
         struct sockaddr_in peer;
         socklen_t plen = sizeof peer;
         int c = accept(lfd, (struct sockaddr *) &peer, &plen);
@@ -623,11 +776,16 @@ int main(void) {
         }
         if (fork() == 0) {
             close(lfd);
+            if (ifd >= 0) close(ifd);
+            if (dfd >= 0) close(dfd);
             handle_conn(c, peer_ip);
             close(c);
             _exit(0);
         }
         close(c);
     }
+    if (ifd >= 0) close(ifd);
+    if (dfd >= 0) close(dfd);
+    close(lfd);
     return 0;
 }

@@ -5,7 +5,8 @@
 #   ./build.sh            # debug APK
 #   ./build.sh release    # release APK（R8，约 998KB）
 #   ./build.sh agent      # 只编 C agent（aarch64）
-#   ./build.sh all        # debug APK + agent
+#   ./build.sh module     # 打包 Magisk/KSU 模块（agent + 可选 release APK）
+#   ./build.sh all        # debug APK + agent + 模块
 #
 # 依赖环境变量:
 #   JAVA_HOME     JDK 17+
@@ -16,14 +17,13 @@ cd "$(dirname "$0")"
 
 TARGET="${1:-debug}"
 
-: "${JAVA_HOME:?请设置 JAVA_HOME（JDK 17+）}"
 : "${ANDROID_HOME:?请设置 ANDROID_HOME（Android SDK）}"
-GRADLE="${GRADLE:-gradle}"
-command -v "$GRADLE" >/dev/null 2>&1 || { echo "找不到 gradle：$GRADLE" >&2; exit 1; }
-
-[ -f local.properties ] || echo "sdk.dir=$ANDROID_HOME" > local.properties
 
 build_app() {
+    : "${JAVA_HOME:?请设置 JAVA_HOME（JDK 17+）}"
+    GRADLE="${GRADLE:-gradle}"
+    command -v "$GRADLE" >/dev/null 2>&1 || { echo "找不到 gradle：$GRADLE" >&2; exit 1; }
+    [ -f local.properties ] || echo "sdk.dir=$ANDROID_HOME" > local.properties
     echo ">> gradle :app:assemble$1"
     "$GRADLE" --console=plain ":app:assemble$1"
     ls -lh app/build/outputs/apk/*/app-*.apk
@@ -44,12 +44,46 @@ build_agent() {
     ls -lh agent/ksv-agent
 }
 
+build_module() {
+    [ -x agent/ksv-agent ] || build_agent
+
+    local ver stage out apk
+    ver=$(sed -n 's/^version=//p' magisk/module.prop)
+    stage="build/magisk-stage"
+    rm -rf "$stage"
+    mkdir -p "$stage/bin"
+    cp -a magisk/. "$stage/"
+    cp -f agent/ksv-agent "$stage/bin/ksv-agent"
+
+    # 有 release APK 就顺带打进去，装模块时一并装上；没有就只装 agent
+    apk="app/build/outputs/apk/release/app-release.apk"
+    if [ -f "$apk" ]; then
+        cp -f "$apk" "$stage/app.apk"
+    else
+        echo "!! 没有 release APK，模块只含 agent（不自动装 app）"
+    fi
+
+    find "$stage" -type f -exec chmod 0644 {} +
+    chmod 0755 "$stage/service.sh" "$stage/customize.sh" \
+               "$stage/META-INF/com/google/android/update-binary" \
+               "$stage/bin/ksv-agent"
+
+    mkdir -p dist
+    out="$(pwd)/dist/keystore-ssh-${ver}.zip"
+    rm -f "$out"
+    ( cd "$stage" && zip -qr9 "$out" . )
+    echo ">> 模块: $out"
+    unzip -l "$out" | tail -n +4
+    ls -lh "$out"
+}
+
 case "$TARGET" in
     debug)   build_app Debug ;;
     release) build_app Release ;;
     agent)   build_agent ;;
-    all)     build_app Debug; build_agent ;;
-    *)       echo "用法: $0 [debug|release|agent|all]" >&2; exit 1 ;;
+    module)  build_module ;;
+    all)     build_app Debug; build_agent; build_module ;;
+    *)       echo "用法: $0 [debug|release|agent|module|all]" >&2; exit 1 ;;
 esac
 
 echo "✓ 完成: $TARGET"
