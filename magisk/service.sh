@@ -6,7 +6,9 @@
 
 MODDIR=${0%/*}
 BIN="$MODDIR/bin/ksv-agent"
-LOG="$MODDIR/ksv-agent.log"
+LOG="/tmp/ksv-agent.log"
+# /tmp 万一不可写就退回 /data/local/tmp
+[ -w /tmp ] || LOG="/data/local/tmp/ksv-agent.log"
 
 # 等系统起来（最多 60 秒）
 i=0
