@@ -25,7 +25,6 @@ import argparse
 import atexit
 import base64
 import hashlib
-import json
 import os
 import socket
 import signal
@@ -171,8 +170,7 @@ def cmd_serve(args):
                     ip = sorted(found)[0]
                     phone["ip"] = ip
                     phone["port"] = int(found[ip].get("tcp") or port)
-                    print(f"[phone-agent] 发现手机 {ip}:{phone['port']} "
-                          f"{found[ip].get('name', '')}", flush=True)
+                    print(f"[phone-agent] 发现手机 {ip}:{phone['port']}", flush=True)
                 elif reprobe:
                     print("[phone-agent] 局域网里没找到手机", flush=True)
             return phone["ip"], phone["port"]
@@ -382,7 +380,7 @@ def probe(wait: float = 2.0, quiet: bool = False) -> dict:
         except OSError:
             break
         try:
-            info = json.loads(data.decode())
+            info = {"tcp": int(data.decode().strip())}
         except Exception:
             continue
         found[addr[0]] = info
@@ -397,7 +395,7 @@ def cmd_discover(args):
         return 1
     for ip in sorted(found):
         i = found[ip]
-        print(f"✓ {ip}:{i.get('tcp', '?')}  {i.get('name', '?')}  keys={i.get('keys', '?')}")
+        print(f"✓ {ip}:{i.get('tcp', '?')}")
     return 0
 
 

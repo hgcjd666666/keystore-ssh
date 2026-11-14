@@ -2,7 +2,7 @@
 //
 // 职责：
 //   · 监听 TCP 7022，跑 ssh-agent 协议
-//   · REQUEST_IDENTITIES -> 读 app 写的 pubkeys.json（只有公钥）
+//   · REQUEST_IDENTITIES -> 读 app 的 shared_prefs（只有公钥）
 //   · SIGN_REQUEST       -> am start 拉起 app 的 SignActivity，把待签数据放 Intent extras，
 //                           签名结果由 app 通过本进程开的临时 socket 回传
 //
@@ -27,7 +27,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/inotify.h>
-#include <sys/system_properties.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -39,7 +38,6 @@
 #define DISCOVERY_PORT   7023
 #define DISCOVER_PROBE   "KSV_DISCOVER"
 #define PREFS_PATH       "/data/data/com.dsh.keystore/shared_prefs/ssh_vault.xml"
-#define PUBKEYS_PATH     "/data/data/com.dsh.keystore/files/pubkeys.json"
 #define AM_PATH          "/system/bin/am"
 #define SIGN_COMPONENT   "com.dsh.keystore/.SignActivity"
 #define SIGN_TIMEOUT_MS  120000
@@ -166,8 +164,7 @@ static char *read_file(const char *path) {
 }
 
 // ---------------------------------------------------------------- 公钥来源
-// 主：app 的 shared_prefs（key_entries 里 pubBlob/comment 是明文 JSON）
-// 备：app 主动导出的 pubkeys.json
+// app 的 shared_prefs（key_entries 里 pubBlob/comment 是明文 JSON）
 //
 // 私钥密文（iv/ct）就在同一个 JSON 里，但它由 TEE 里的 KEK 加密，
 // 本进程既解不开也用不上；这里只取公钥。
@@ -234,33 +231,6 @@ static int parse_entries_json(const char *json, ksv_key_t **out) {
     return n;
 }
 
-/** 解析 pubkeys.json：[{"comment":"dsh","pub":"AAA..."}] */
-static int parse_pubkeys_json(const char *json, ksv_key_t **out) {
-    int cap = 16, n = 0;
-    ksv_key_t *keys = calloc(cap, sizeof(ksv_key_t));
-    if (!keys) return -1;
-    const char *p = json;
-    for (;;) {
-        const char *cs = strstr(p, "\"comment\":\"");
-        if (!cs) break;
-        cs += strlen("\"comment\":\"");
-        const char *ce = strchr(cs, '"');
-        if (!ce) break;
-        const char *ps = strstr(ce, "\"pub\":\"");
-        if (!ps) break;
-        ps += strlen("\"pub\":\"");
-        const char *pe = strchr(ps, '"');
-        if (!pe) break;
-        if (n >= cap) { cap *= 2; keys = realloc(keys, cap * sizeof(ksv_key_t)); }
-        keys[n].comment = strndup(cs, (size_t) (ce - cs));
-        keys[n].pub = strndup(ps, (size_t) (pe - ps));
-        n++;
-        p = pe;
-    }
-    *out = keys;
-    return n;
-}
-
 static int load_pubkeys(ksv_key_t **out) {
     // 1) 直接读 app 的 shared_prefs（root 可读，公钥明文）
     char *xml = read_file(PREFS_PATH);
@@ -273,15 +243,8 @@ static int load_pubkeys(ksv_key_t **out) {
             if (n > 0) return n;
         }
     }
-    // 2) 回退：pubkeys.json（app 导出的索引）
-    char *j = read_file(PUBKEYS_PATH);
-    if (!j) {
-        *out = NULL;
-        return 0;
-    }
-    int n = parse_pubkeys_json(j, out);
-    free(j);
-    return n;
+    *out = NULL;
+    return 0;
 }
 
 // ---------------------------------------------------------------- 协议读写
@@ -667,7 +630,7 @@ static int module_dir_gone(int fd, const char *id) {
 
 // ---------------------------------------------------------------- UDP 发现
 
-// 局域网内 PC 发 KSV_DISCOVER 到 7023，这里回一个 JSON 告诉它端口和机型
+// 局域网内 PC 发 KSV_DISCOVER 到 7023，这里回个端口号
 static int setup_discovery(void) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) return -1;
@@ -694,12 +657,9 @@ static void answer_discovery(int fd) {
     req[n] = '\0';
     if (strcmp(req, DISCOVER_PROBE) != 0) return;
 
-    char model[PROP_VALUE_MAX] = "";
-    __system_property_get("ro.product.model", model);
-    char resp[256];
-    snprintf(resp, sizeof resp, "{\"tcp\":%d,\"name\":\"%s\"}", LISTEN_PORT,
-             model[0] ? model : "android");
-    sendto(fd, resp, strlen(resp), 0, (struct sockaddr *) &from, flen);
+    char resp[16];
+    int n2 = snprintf(resp, sizeof resp, "%d", LISTEN_PORT);
+    sendto(fd, resp, (size_t) n2, 0, (struct sockaddr *) &from, flen);
 }
 
 int main(void) {
