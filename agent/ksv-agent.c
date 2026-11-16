@@ -2,17 +2,24 @@
 //
 // 职责：
 //   · 监听 TCP 7022，跑 ssh-agent 协议
+//   · 可选：额外监听一个 unix socket，路径由启动参数传入，给本机 openssh 直接当
+//     SSH_AUTH_SOCK 用（export SSH_AUTH_SOCK=/data/local/tmp/ksv-agent.sock）
 //   · REQUEST_IDENTITIES -> 读 app 的 shared_prefs（只有公钥）
 //   · SIGN_REQUEST       -> am start 拉起 app 的 SignActivity，把待签数据放 Intent extras，
 //                           签名结果由 app 通过本进程开的临时 socket 回传
 //
 // 私钥始终在 app 的 Keystore 里，本进程只转发协议。
 //
-// 编译：NDK clang -O2 -o ksv-agent ksv-agent.c
-// 运行：su -c "nohup /data/local/tmp/ksv-agent >/data/local/tmp/ksv-agent.log 2>&1 &"
+// 守护化（等 boot_completed、日志文件、单实例检查）都在本程序里，
+// 路径由启动参数给出；单实例直接看 unix socket 在不在、连不连得上，
+// 不需要额外的锁文件。
 //
-// 作为 Magisk 模块启动时（/data/adb/modules/<id>/bin/ksv-agent），会用 inotify
-// 盯着模块目录：模块被卸载（目录消失）时立即自行退出，无需 uninstall.sh。
+// 编译：NDK clang -O2 -o ksv-agent ksv-agent.c
+// 运行：
+//   su -c '/data/local/tmp/ksv-agent -s /data/local/tmp/ksv-agent.sock \
+//          -l /data/local/tmp/ksv-agent.log'
+//
+// 模块卸载后本来就得重启，所以不需要 uninstall.sh，也不做存活监视。
 
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -26,11 +33,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/inotify.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/wait.h>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 #include <limits.h>
 #include <unistd.h>
 
@@ -41,6 +52,10 @@
 #define AM_PATH          "/system/bin/am"
 #define SIGN_COMPONENT   "com.dsh.keystore/.SignActivity"
 #define SIGN_TIMEOUT_MS  120000
+
+// 实际监听的 TCP 端口：7022 被占用时退避到内核分配的随机端口，
+// UDP 发现会把这个值回报给 PC，所以端口变了也不影响连接。
+static int g_listen_port = LISTEN_PORT;
 
 #define SSH_AGENT_FAILURE             5
 #define SSH_AGENT_SUCCESS             6
@@ -563,71 +578,6 @@ static void handle_conn(int fd, const char *peer_ip) {
     free(ctx.bind_sig);
 }
 
-// ---------------------------------------------------------------- 模块存活监视
-
-// 本进程若位于 Magisk/KSU 模块目录（/data/adb/modules/<id>/...），返回一个
-// inotify fd 监听"模块目录被删除"；否则返回 -1（手动 /data/local/tmp 运行时不监视）。
-// out_id 带回模块 id。
-static int watch_module_dir(char *out_dir, size_t dlen, char *out_id, size_t idlen) {
-    char exe[PATH_MAX];
-    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
-    if (n <= 0) return -1;
-    exe[n] = '\0';
-
-    static const char base[] = "/data/adb/modules";
-    if (strncmp(exe, base, sizeof base - 1) != 0) return -1;
-
-    char *p = exe + sizeof base - 1;
-    if (strncmp(p, "_update", 7) == 0) p += 7;   // 装完还没重启时在 modules_update
-    if (*p != '/') return -1;
-
-    char *id = p + 1;
-    char *slash = strchr(id, '/');
-    if (!slash) return -1;              // 直接躺在 modules/ 下，不是模块
-    *slash = '\0';                      // exe 截断成模块目录
-    if (strlen(id) >= idlen) return -1;
-    snprintf(out_id, idlen, "%s", id);
-
-    if (strlen(exe) >= dlen) return -1;
-    snprintf(out_dir, dlen, "%s", exe);
-
-    char parent[PATH_MAX];
-    snprintf(parent, sizeof parent, "%s", exe);
-    char *ps = strrchr(parent, '/');
-    if (!ps) return -1;
-    *ps = '\0';
-
-    int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-    if (fd < 0) return -1;
-
-    // 目录自身被删除 / 被移走
-    if (inotify_add_watch(fd, exe, IN_DELETE_SELF | IN_MOVE_SELF | IN_ONLYDIR) < 0) {
-        close(fd);
-        return -1;
-    }
-    // 父目录里 <id> 被删除（rm -rf 时先收到这一条）
-    if (inotify_add_watch(fd, parent, IN_DELETE) < 0) {
-        close(fd);
-        return -1;
-    }
-    return fd;
-}
-
-// 读空 inotify 队列；返回 1 表示模块目录已消失
-static int module_dir_gone(int fd, const char *id) {
-    char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
-    for (;;) {
-        ssize_t n = read(fd, buf, sizeof buf);
-        if (n <= 0) return 0;
-        for (char *p = buf; p < buf + n;) {
-            struct inotify_event *ev = (struct inotify_event *) p;
-            if (ev->mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED)) return 1;
-            if ((ev->mask & IN_DELETE) && ev->len > 0 && strcmp(ev->name, id) == 0) return 1;
-            p += sizeof(struct inotify_event) + ev->len;
-        }
-    }
-}
-
 // ---------------------------------------------------------------- UDP 发现
 
 // 局域网内 PC 发 KSV_DISCOVER 到 7023，这里回个端口号
@@ -658,55 +608,280 @@ static void answer_discovery(int fd) {
     if (strcmp(req, DISCOVER_PROBE) != 0) return;
 
     char resp[16];
-    int n2 = snprintf(resp, sizeof resp, "%d", LISTEN_PORT);
+    int n2 = snprintf(resp, sizeof resp, "%d", g_listen_port);
     sendto(fd, resp, (size_t) n2, 0, (struct sockaddr *) &from, flen);
 }
 
-int main(void) {
-    signal(SIGCHLD, SIG_IGN);
-    signal(SIGPIPE, SIG_IGN);
+// ---------------------------------------------------------------- unix socket
 
-    int lfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (lfd < 0) { perror("socket"); return 1; }
+/**
+ * 监听一个 unix 域 socket，供本机进程（openssh）直接使用。
+ *
+ * 路径由启动参数给出，本程序不猜默认值。绑定前会清掉上次运行残留的
+ * socket 文件；路径上如果是普通文件/目录就拒绝，避免误删。
+ * 权限交给调用方（server.sh 按需 chmod），这里只保证 bind+listen。
+ */
+static int setup_unix_listener(const char *path) {
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sun_family = AF_UNIX;
+    if (strlen(path) >= sizeof sa.sun_path) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    strcpy(sa.sun_path, path);
+
+    struct stat st;
+    if (lstat(path, &st) == 0) {
+        if (!S_ISSOCK(st.st_mode)) {
+            errno = EEXIST;     // 路径已被别的文件占了，不能动
+            return -1;
+        }
+        unlink(path);           // 上次的残留 socket 文件
+    } else if (errno != ENOENT) {
+        return -1;
+    }
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    if (bind(fd, (struct sockaddr *) &sa, sizeof sa) < 0) {
+        int e = errno;
+        close(fd);
+        errno = e;
+        return -1;
+    }
+    if (listen(fd, 16) < 0) {
+        int e = errno;
+        close(fd);
+        unlink(path);
+        errno = e;
+        return -1;
+    }
+    return fd;
+}
+
+/**
+ * 探测 unix socket 是否还有活着的监听者：connect 成功就说明有人 listen，
+ * 顺便用 SO_PEERCRED 拿到对端 pid。返回 1=活着，0=不存在或只是残留文件。
+ */
+static int socket_alive(const char *path, pid_t *out_pid) {
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sun_family = AF_UNIX;
+    if (strlen(path) >= sizeof sa.sun_path) return 0;
+    strcpy(sa.sun_path, path);
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return 0;
+    int alive = 0;
+    if (connect(fd, (struct sockaddr *) &sa, sizeof sa) == 0) {
+        alive = 1;
+        if (out_pid) {
+            struct ucred cr;
+            socklen_t cl = sizeof cr;
+            *out_pid = 0;
+            if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &cl) == 0) *out_pid = cr.pid;
+        }
+    }
+    close(fd);
+    return alive;
+}
+
+// ---------------------------------------------------------------- 守护化
+// 这一节原来是 magisk/service.sh 里的 shell 逻辑：等 boot、日志文件、
+// 单实例检查。现在全部搬进本程序（后台化交给启动脚本的 &）。
+//
+// 单实例不再用锁文件：unix socket 在、而且连得上，就说明另一个实例活着
+// （还能从 SO_PEERCRED 拿到它的 pid）；连不上就是上次留下的死 socket，
+// 直接清掉重绑。
+
+/** 打开日志文件：存在就截断重写，不做轮转。 */
+static int open_log(const char *path) {
+    return open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+}
+
+/** 把 stdout/stderr 接到日志文件。 */
+static void redirect_log(int fd) {
+    if (fd < 0) return;
+    dup2(fd, STDOUT_FILENO);
+    dup2(fd, STDERR_FILENO);
+    if (fd > STDERR_FILENO) close(fd);
+}
+
+/** sys.boot_completed 是否为 1（非 Android 构建下视为已完成）。 */
+static int boot_completed(void) {
+#ifdef __ANDROID__
+    char v[PROP_VALUE_MAX];
+    v[0] = 0;
+    __system_property_get("sys.boot_completed", v);
+    return v[0] == '1';
+#else
+    return 1;
+#endif
+}
+
+// ---------------------------------------------------------------- 入口
+
+static void usage(const char *argv0) {
+    fprintf(stderr,
+            "用法: %s [-s <unix socket>] [-p <tcp 端口>] [-l <日志>] "
+            "[--no-wait-boot]\n"
+            "  -s, --socket <路径>   unix socket 路径，给本机 openssh 当 SSH_AUTH_SOCK；\n"
+            "                        这个 socket 还连得上就说明已有实例在跑，直接退出\n"
+            "  -p, --port <端口>     TCP 端口（默认 %d；被占用时退避到随机端口）\n"
+            "  -l, --log <文件>      日志文件：存在就截断重写，然后接管 stdout/stderr\n"
+            "      --no-wait-boot    不等 sys.boot_completed\n"
+            "  -h, --help            显示本帮助\n",
+            argv0, LISTEN_PORT);
+}
+
+/** 绑定 TCP 监听；port=0 表示让内核分配随机端口。失败返回 -1。 */
+static int make_tcp_listener(int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
     int on = 1;
-    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
     sa.sin_addr.s_addr = htonl(INADDR_ANY);
-    sa.sin_port = htons(LISTEN_PORT);
-    if (bind(lfd, (struct sockaddr *) &sa, sizeof sa) < 0) { perror("bind"); return 1; }
-    if (listen(lfd, 16) < 0) { perror("listen"); return 1; }
+    sa.sin_port = htons((uint16_t) port);
+    if (bind(fd, (struct sockaddr *) &sa, sizeof sa) < 0) {
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, 16) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
 
-    logf("ksv-agent listening on 0.0.0.0:%d", LISTEN_PORT);
+/** 子进程：关掉继承来的监听 fd，处理一条连接。 */
+static void spawn_conn(int c, const char *peer, int lfd, int sfd, int dfd) {
+    if (fork() == 0) {
+        close(lfd);
+        if (sfd >= 0) close(sfd);
+        if (dfd >= 0) close(dfd);
+        handle_conn(c, peer);
+        close(c);
+        _exit(0);
+    }
+    close(c);
+}
 
-    char mod_id[64] = "";
-    char mod_dir[PATH_MAX] = "";
-    int ifd = watch_module_dir(mod_dir, sizeof mod_dir, mod_id, sizeof mod_id);
-    if (ifd >= 0) logf("监视模块目录 %s（被删除时退出）", mod_dir);
+int main(int argc, char **argv) {
+    signal(SIGCHLD, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN);
+
+    const char *sock_path = NULL;
+    const char *log_path = NULL;
+    int want_port = LISTEN_PORT;
+    int wait_boot = 1;
+
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-s") || !strcmp(argv[i], "--socket")) {
+            if (++i >= argc) { usage(argv[0]); return 1; }
+            sock_path = argv[i];
+        } else if (!strcmp(argv[i], "-p") || !strcmp(argv[i], "--port")) {
+            if (++i >= argc) { usage(argv[0]); return 1; }
+            char *end = NULL;
+            long v = strtol(argv[i], &end, 10);
+            if (!end || *end || v <= 0 || v > 65535) {
+                logf("端口无效: %s", argv[i]);
+                return 1;
+            }
+            want_port = (int) v;
+        } else if (!strcmp(argv[i], "-l") || !strcmp(argv[i], "--log")) {
+            if (++i >= argc) { usage(argv[0]); return 1; }
+            log_path = argv[i];
+        } else if (!strcmp(argv[i], "--no-wait-boot")) {
+            wait_boot = 0;
+        } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+            usage(argv[0]);
+            return 0;
+        } else if (argv[i][0] != '-' && !sock_path) {
+            sock_path = argv[i];        // 兼容 server.sh 直接传一个位置参数
+        } else {
+            usage(argv[0]);
+            return 1;
+        }
+    }
+
+    // 日志：存在就截断重写，然后接管 stdout/stderr
+    if (log_path) {
+        int lf = open_log(log_path);
+        if (lf < 0) {
+            fprintf(stderr, "打开日志 %s 失败: %s\n", log_path, strerror(errno));
+        } else {
+            redirect_log(lf);
+        }
+    }
+
+    // 单实例：socket 文件在而且连得上，说明另一个实例正活着
+    if (sock_path) {
+        pid_t owner = 0;
+        if (socket_alive(sock_path, &owner)) {
+            logf("已有实例在运行（%s，pid=%d），退出", sock_path, (int) owner);
+            return 0;
+        }
+    }
+
+    if (wait_boot) {
+        int i;
+        for (i = 0; i < 60 && !boot_completed(); i++) sleep(1);
+        if (i >= 60) logf("等 sys.boot_completed 超时，照常启动");
+    }
+
+    int lfd = make_tcp_listener(want_port);
+    if (lfd < 0) {
+        // 端口被占就退避：让内核随机挑一个，UDP 发现会把真实端口报出去
+        logf("TCP %d 绑定失败（%s），退避到随机端口", want_port, strerror(errno));
+        lfd = make_tcp_listener(0);
+        if (lfd < 0) { perror("bind"); return 1; }
+    }
+    {
+        struct sockaddr_in got;
+        socklen_t gl = sizeof got;
+        if (getsockname(lfd, (struct sockaddr *) &got, &gl) == 0) {
+            g_listen_port = ntohs(got.sin_port);
+        }
+    }
+    logf("ksv-agent listening on 0.0.0.0:%d", g_listen_port);
+
+    int sfd = -1;
+    if (sock_path) {
+        sfd = setup_unix_listener(sock_path);
+        if (sfd < 0) {
+            logf("unix socket %s 监听失败: %s", sock_path, strerror(errno));
+            close(lfd);
+            return 1;
+        }
+        logf("unix socket: %s（本机 openssh 可 export SSH_AUTH_SOCK=%s）", sock_path, sock_path);
+    }
 
     int dfd = setup_discovery();
     if (dfd >= 0) logf("UDP 发现在 %d 上待命", DISCOVERY_PORT);
 
     for (;;) {
-        struct pollfd pfd[3];
+        struct pollfd pfd[4];
         int nfds = 0;
         int i_lfd = nfds++;
         pfd[i_lfd].fd = lfd;
         pfd[i_lfd].events = POLLIN;
         pfd[i_lfd].revents = 0;
-        int i_ifd = -1, i_dfd = -1;
-        if (ifd >= 0) {
-            i_ifd = nfds++;
-            pfd[i_ifd].fd = ifd;
-            pfd[i_ifd].events = POLLIN;
-            pfd[i_ifd].revents = 0;
-        }
+        int i_dfd = -1, i_sfd = -1;
         if (dfd >= 0) {
             i_dfd = nfds++;
             pfd[i_dfd].fd = dfd;
             pfd[i_dfd].events = POLLIN;
             pfd[i_dfd].revents = 0;
+        }
+        if (sfd >= 0) {
+            i_sfd = nfds++;
+            pfd[i_sfd].fd = sfd;
+            pfd[i_sfd].events = POLLIN;
+            pfd[i_sfd].revents = 0;
         }
 
         int pr = poll(pfd, nfds, -1);
@@ -717,34 +892,37 @@ int main(void) {
         }
 
         if (i_dfd >= 0 && (pfd[i_dfd].revents & POLLIN)) answer_discovery(dfd);
-        if (i_ifd >= 0 && (pfd[i_ifd].revents & POLLIN) && module_dir_gone(ifd, mod_id)) {
-            logf("模块 %s 已被移除，退出", mod_id);
-            break;
+        // TCP 连接（PC 侧）
+        if (pfd[i_lfd].revents & POLLIN) {
+            struct sockaddr_in peer;
+            socklen_t plen = sizeof peer;
+            int c = accept(lfd, (struct sockaddr *) &peer, &plen);
+            if (c < 0) {
+                if (errno == EINTR) continue;
+                perror("accept");
+                break;
+            }
+            char peer_ip[INET_ADDRSTRLEN];
+            if (inet_ntop(AF_INET, &peer.sin_addr, peer_ip, sizeof peer_ip) == NULL) {
+                strcpy(peer_ip, "?");
+            }
+            spawn_conn(c, peer_ip, lfd, sfd, dfd);
         }
-        if (!(pfd[i_lfd].revents & POLLIN)) continue;
 
-        struct sockaddr_in peer;
-        socklen_t plen = sizeof peer;
-        int c = accept(lfd, (struct sockaddr *) &peer, &plen);
-        if (c < 0) {
-            if (errno == EINTR) continue;
-            break;
+        // unix socket 连接（本机 openssh）
+        if (i_sfd >= 0 && (pfd[i_sfd].revents & POLLIN)) {
+            int c = accept(sfd, NULL, NULL);
+            if (c < 0) {
+                if (errno != EINTR) perror("accept(unix)");
+                continue;
+            }
+            spawn_conn(c, "unix", lfd, sfd, dfd);
         }
-        char peer_ip[INET_ADDRSTRLEN];
-        if (inet_ntop(AF_INET, &peer.sin_addr, peer_ip, sizeof peer_ip) == NULL) {
-            strcpy(peer_ip, "?");
-        }
-        if (fork() == 0) {
-            close(lfd);
-            if (ifd >= 0) close(ifd);
-            if (dfd >= 0) close(dfd);
-            handle_conn(c, peer_ip);
-            close(c);
-            _exit(0);
-        }
-        close(c);
     }
-    if (ifd >= 0) close(ifd);
+    if (sfd >= 0) {
+        close(sfd);
+        if (sock_path) unlink(sock_path);    // 退出时清掉 socket 文件
+    }
     if (dfd >= 0) close(dfd);
     close(lfd);
     return 0;

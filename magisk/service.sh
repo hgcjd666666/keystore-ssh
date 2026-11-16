@@ -1,26 +1,13 @@
 #!/system/bin/sh
 # late_start service 阶段：拉起 ksv-agent
 #
-# agent 自己用 inotify 盯着模块目录，模块被删（卸载）时它会自行退出，
-# 所以这里不需要 uninstall.sh。
+# 等 boot_completed、日志文件、单实例检查都已经在 ksv-agent 自己里，
+# 这里只负责把路径传进去（路径全部由启动参数决定，程序里没有默认值）。
+#
+# 模块卸载后本来就要重启，所以这里不需要 uninstall.sh。
 
 MODDIR=${0%/*}
-BIN="$MODDIR/bin/ksv-agent"
-LOG="/tmp/ksv-agent.log"
-# /tmp 万一不可写就退回 /data/local/tmp
-[ -w /tmp ] || LOG="/data/local/tmp/ksv-agent.log"
 
-# 等系统起来（最多 60 秒）
-i=0
-while [ "$(getprop sys.boot_completed)" != "1" ] && [ "$i" -lt 60 ]; do
-  i=$((i + 1))
-  sleep 1
-done
-
-# 日志轮转，避免无限增长
-[ -f "$LOG" ] && mv -f "$LOG" "$LOG.old"
-
-# 已在运行就不重复拉起
-if ! pidof ksv-agent >/dev/null 2>&1; then
-  setsid "$BIN" >>"$LOG" 2>&1 </dev/null &
-fi
+setsid "$MODDIR/bin/ksv-agent" \
+  -s /tmp/ksv-agent.sock \
+  -l /tmp/ksv-agent.log &

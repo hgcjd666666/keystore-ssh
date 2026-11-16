@@ -23,11 +23,11 @@ ssh ──> ~/.ssh/phone-agent.sock         KeystoreSSH app（Keystore + 指纹�
 
 ### 1. 手机装 app
 
-`keystore-ssh-v1.0.apk`，打开后生成一把密钥，或者粘贴已有的 OpenSSH Ed25519 私钥导入
+`keystore-ssh-v0.2.apk`，打开后生成一把密钥，或者粘贴已有的 OpenSSH Ed25519 私钥导入
 
 ### 2. 手机装模块（需要 root）
 
-`keystore-ssh-v1.0.zip`，在 Magisk / KernelSU 里安装，重启
+`keystore-ssh-v0.2.zip`，在 Magisk / KernelSU 里安装，重启
 
 模块里只有一个 `ksv-agent`，重启后会在 late_start service 阶段自己起来监听 7022
 或者你也可以让ai魔改一个shell权限的守护进程（类似shizuku那种）
@@ -35,8 +35,8 @@ ssh ──> ~/.ssh/phone-agent.sock         KeystoreSSH app（Keystore + 指纹�
 ### 3. 电脑装桥接
 
 ```bash
-unzip keystore-ssh-pc-v1.0.zip
-cd pc
+git clone https://github.com/hgcjd666666/keystore-ssh
+cd keystore-ssh/pc
 ./install.sh
 ```
 
