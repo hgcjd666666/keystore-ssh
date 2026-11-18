@@ -1,20 +1,37 @@
-# Gradle / Android
-*.iml
-.gradle
-/local.properties
-/.idea
-.DS_Store
-/build
-/app/build
-/captures
-.externalNativeBuild
-.cxx
+# 白名单：默认忽略一切，只放行仓库里要跟的文件
+*
+!*/
 
-# 构建产物
+# 放行的文件类型 / 路径
+!.gitignore
+!*.c
+!*.h
+!*.md
+!*.sh
+!*.py
+!*.kt
+!*.java
+!*.xml
+!*.gradle
+!*.properties
+!*.pro
+!magisk/META-INF/com/google/android/*
+
+# 重新忽略构建/环境产物（覆盖上面按扩展名的放行）
+local.properties
+/build/
+/app/build/
+/.gradle/
+/.idea/
+/.kotlin/
+/.cxx/
+/.externalNativeBuild/
+/captures/
+/dist/
+*.iml
+.DS_Store
 *.apk
 *.aab
 
-# C agent 编译产物
+# C agent 编译产物（无扩展名，本来就进不来，写明白点）
 /agent/ksv-agent
-/.kotlin
-dist/

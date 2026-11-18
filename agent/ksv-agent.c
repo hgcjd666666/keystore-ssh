@@ -10,7 +10,7 @@
 //
 // 私钥始终在 app 的 Keystore 里，本进程只转发协议。
 //
-// 守护化（等 boot_completed、日志文件、单实例检查）都在本程序里，
+// 守护化（日志文件、单实例检查）都在本程序里，
 // 路径由启动参数给出；单实例直接看 unix socket 在不在、连不连得上，
 // 不需要额外的锁文件。
 //
@@ -24,6 +24,7 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -34,14 +35,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/inotify.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
-#ifdef __ANDROID__
-#include <sys/system_properties.h>
-#endif
 #include <limits.h>
 #include <unistd.h>
 
@@ -439,6 +438,7 @@ static void handle_conn(int fd, const char *peer_ip) {
     if (target[0]) logf("target=%s (from %s)", target, peer_ip);
     conn_ctx_t ctx = {0};
     buf_t pkt;
+    buf_init(&pkt);
     while (read_packet(fd, &pkt) == 0) {
         unsigned type = pkt.p[0];
         buf_t resp;
@@ -571,6 +571,7 @@ static void handle_conn(int fd, const char *peer_ip) {
         }
         free(resp.p);
         free(pkt.p);
+        pkt.p = NULL;       // read_packet 失败时 pkt 还是上一次的指针，别free两遍
     }
     free(pkt.p);
     free(ctx.hostkey);
@@ -660,6 +661,156 @@ static int setup_unix_listener(const char *path) {
     return fd;
 }
 
+// ---------------------------------------------------------------- socket 防删除
+//
+// socket 摆在 /tmp 这种谁都能动的地方，清理脚本一跑就没了：监听 fd 还在，
+// 但路径没了，新的连接连不上。--lock 启用时用 inotify 盯住父目录：
+// 文件被删就重新 bind，被改名就按 inode 找出来改回去。
+// 父目录自己都不在了就跳过，不管。
+
+typedef struct {
+    const char *path;               // socket 路径
+    char dir[PATH_MAX];             // 父目录
+    char base[NAME_MAX + 1];        // 文件名
+    int sfd;                        // 当前监听 fd
+    int ifd;                        // inotify fd，-1 表示没装上
+    dev_t dev;                      // 正在监听的 socket 文件身份
+    ino_t ino;
+} sock_guard_t;
+
+/** 把 path 拆成父目录 + 文件名；必须带目录（否则没地方装 inotify）。 */
+static int guard_split(const char *path, char *dir, size_t dirlen,
+                       char *base, size_t baselen) {
+    const char *slash = strrchr(path, '/');
+    if (!slash) return -1;
+    size_t dl = (size_t) (slash - path);
+    if (dl == 0 || dl >= dirlen) return -1;
+    memcpy(dir, path, dl);
+    dir[dl] = 0;
+    const char *b = slash + 1;
+    if (!*b || strlen(b) >= baselen) return -1;
+    strcpy(base, b);
+    return 0;
+}
+
+/** 装上父目录的 watch。目录不存在/不是目录就失败。 */
+static int guard_watch(sock_guard_t *g) {
+    if (g->ifd >= 0) return 0;
+    int fd = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
+    if (fd < 0) return -1;
+    int wd = inotify_add_watch(fd, g->dir,
+                               IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_DELETE_SELF |
+                               IN_MOVE_SELF | IN_ONLYDIR);
+    if (wd < 0) {
+        int e = errno;
+        close(fd);
+        errno = e;
+        return -1;
+    }
+    g->ifd = fd;
+    return 0;
+}
+
+/** 把事件队列读空；watch 自己没了（目录被删/被移走）就丢掉 ifd。 */
+static void guard_drain(sock_guard_t *g) {
+    char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
+    while (g->ifd >= 0) {
+        ssize_t n = read(g->ifd, buf, sizeof buf);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;                  // EAGAIN：读干净了
+        }
+        if (n == 0) break;
+        for (char *p = buf; p < buf + n; ) {
+            struct inotify_event *ev = (struct inotify_event *) p;
+            if (ev->mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED)) {
+                close(g->ifd);
+                g->ifd = -1;
+                return;
+            }
+            p += sizeof(struct inotify_event) + ev->len;
+        }
+    }
+}
+
+/** socket 被改名了：按 dev/ino 在父目录里找出来，rename 回原名。 */
+static int guard_restore_name(sock_guard_t *g) {
+    int dfd = open(g->dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) return -1;
+    DIR *d = fdopendir(dfd);
+    if (!d) { close(dfd); return -1; }
+
+    char found[NAME_MAX + 1];
+    found[0] = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        struct stat s;
+        if (fstatat(dirfd(d), de->d_name, &s, AT_SYMLINK_NOFOLLOW) != 0) continue;
+        if (s.st_dev == g->dev && s.st_ino == g->ino) {
+            snprintf(found, sizeof found, "%s", de->d_name);
+            break;
+        }
+    }
+
+    int ok = -1;
+    if (found[0] && renameat(dirfd(d), found, dirfd(d), g->base) == 0) {
+        logf("socket 被改名为 %s，已改回 %s", found, g->base);
+        ok = 0;
+    }
+    closedir(d);
+    return ok;
+}
+
+/** bind 一个新的 socket 并接管监听；失败返回 -1。 */
+static int guard_bind(sock_guard_t *g) {
+    int fd = setup_unix_listener(g->path);
+    if (fd < 0) return -1;
+    if (g->sfd >= 0) close(g->sfd);
+    g->sfd = fd;
+    struct stat st;
+    if (lstat(g->path, &st) == 0) {
+        g->dev = st.st_dev;
+        g->ino = st.st_ino;
+    }
+    return 0;
+}
+
+/** socket 文件不对了就修：改名了改回去，删了就重建；目录不在就跳过。 */
+static void guard_repair(sock_guard_t *g) {
+    if (g->ifd < 0) guard_watch(g);     // watch 丢过（目录被移走又回来）就补上
+
+    struct stat st;
+    if (lstat(g->path, &st) == 0 && S_ISSOCK(st.st_mode) &&
+        st.st_dev == g->dev && st.st_ino == g->ino)
+        return;                         // 还是原来那个
+
+    struct stat d;
+    if (stat(g->dir, &d) != 0 || !S_ISDIR(d.st_mode))
+        return;                         // 目录不在，没地方放，跳过
+
+    if (guard_restore_name(g) == 0) return;
+    if (guard_bind(g) == 0) logf("unix socket %s 不见了，已重新监听", g->path);
+    else logf("重建 unix socket %s 失败: %s", g->path, strerror(errno));
+}
+
+/** 初次建 socket + 装 watch。bind 失败才算致命（和原来的行为一致）。 */
+static int guard_start(sock_guard_t *g, const char *path) {
+    memset(g, 0, sizeof *g);
+    g->path = path;
+    g->sfd = -1;
+    g->ifd = -1;
+    if (guard_split(path, g->dir, sizeof g->dir, g->base, sizeof g->base) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (guard_bind(g) != 0) return -1;
+    if (guard_watch(g) != 0)
+        logf("inotify 监视 %s 装不上（%s），socket 被删不会自动恢复",
+             g->dir, strerror(errno));
+    return 0;
+}
+
 /**
  * 探测 unix socket 是否还有活着的监听者：connect 成功就说明有人 listen，
  * 顺便用 SO_PEERCRED 拿到对端 pid。返回 1=活着，0=不存在或只是残留文件。
@@ -708,29 +859,18 @@ static void redirect_log(int fd) {
     if (fd > STDERR_FILENO) close(fd);
 }
 
-/** sys.boot_completed 是否为 1（非 Android 构建下视为已完成）。 */
-static int boot_completed(void) {
-#ifdef __ANDROID__
-    char v[PROP_VALUE_MAX];
-    v[0] = 0;
-    __system_property_get("sys.boot_completed", v);
-    return v[0] == '1';
-#else
-    return 1;
-#endif
-}
-
 // ---------------------------------------------------------------- 入口
 
 static void usage(const char *argv0) {
     fprintf(stderr,
             "用法: %s [-s <unix socket>] [-p <tcp 端口>] [-l <日志>] "
-            "[--no-wait-boot]\n"
+            "[--lock]\n"
             "  -s, --socket <路径>   unix socket 路径，给本机 openssh 当 SSH_AUTH_SOCK；\n"
             "                        这个 socket 还连得上就说明已有实例在跑，直接退出\n"
             "  -p, --port <端口>     TCP 端口（默认 %d；被占用时退避到随机端口）\n"
             "  -l, --log <文件>      日志文件：存在就截断重写，然后接管 stdout/stderr\n"
-            "      --no-wait-boot    不等 sys.boot_completed\n"
+            "      --lock            给 unix socket 上锁（配合 -s）：文件被删就重建、\n"
+            "                        被改名就改回去（父目录不在时跳过）\n"
             "  -h, --help            显示本帮助\n",
             argv0, LISTEN_PORT);
 }
@@ -777,7 +917,7 @@ int main(int argc, char **argv) {
     const char *sock_path = NULL;
     const char *log_path = NULL;
     int want_port = LISTEN_PORT;
-    int wait_boot = 1;
+    int sock_lock = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-s") || !strcmp(argv[i], "--socket")) {
@@ -795,8 +935,8 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "-l") || !strcmp(argv[i], "--log")) {
             if (++i >= argc) { usage(argv[0]); return 1; }
             log_path = argv[i];
-        } else if (!strcmp(argv[i], "--no-wait-boot")) {
-            wait_boot = 0;
+        } else if (!strcmp(argv[i], "--lock")) {
+            sock_lock = 1;
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage(argv[0]);
             return 0;
@@ -827,12 +967,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (wait_boot) {
-        int i;
-        for (i = 0; i < 60 && !boot_completed(); i++) sleep(1);
-        if (i >= 60) logf("等 sys.boot_completed 超时，照常启动");
-    }
-
     int lfd = make_tcp_listener(want_port);
     if (lfd < 0) {
         // 端口被占就退避：让内核随机挑一个，UDP 发现会把真实端口报出去
@@ -850,7 +984,20 @@ int main(int argc, char **argv) {
     logf("ksv-agent listening on 0.0.0.0:%d", g_listen_port);
 
     int sfd = -1;
-    if (sock_path) {
+    sock_guard_t guard;
+    int has_guard = 0;
+    memset(&guard, 0, sizeof guard);
+    if (sock_path && sock_lock) {
+        if (guard_start(&guard, sock_path) != 0) {
+            logf("unix socket %s 监听失败: %s", sock_path, strerror(errno));
+            close(lfd);
+            return 1;
+        }
+        has_guard = 1;
+        sfd = guard.sfd;
+        logf("unix socket: %s（本机 openssh 可 export SSH_AUTH_SOCK=%s，已加锁）",
+             sock_path, sock_path);
+    } else if (sock_path) {
         sfd = setup_unix_listener(sock_path);
         if (sfd < 0) {
             logf("unix socket %s 监听失败: %s", sock_path, strerror(errno));
@@ -864,13 +1011,14 @@ int main(int argc, char **argv) {
     if (dfd >= 0) logf("UDP 发现在 %d 上待命", DISCOVERY_PORT);
 
     for (;;) {
-        struct pollfd pfd[4];
+        if (has_guard) sfd = guard.sfd;
+        struct pollfd pfd[5];
         int nfds = 0;
         int i_lfd = nfds++;
         pfd[i_lfd].fd = lfd;
         pfd[i_lfd].events = POLLIN;
         pfd[i_lfd].revents = 0;
-        int i_dfd = -1, i_sfd = -1;
+        int i_dfd = -1, i_sfd = -1, i_ifd = -1;
         if (dfd >= 0) {
             i_dfd = nfds++;
             pfd[i_dfd].fd = dfd;
@@ -883,6 +1031,12 @@ int main(int argc, char **argv) {
             pfd[i_sfd].events = POLLIN;
             pfd[i_sfd].revents = 0;
         }
+        if (has_guard && guard.ifd >= 0) {
+            i_ifd = nfds++;
+            pfd[i_ifd].fd = guard.ifd;
+            pfd[i_ifd].events = POLLIN;
+            pfd[i_ifd].revents = 0;
+        }
 
         int pr = poll(pfd, nfds, -1);
         if (pr < 0) {
@@ -891,6 +1045,12 @@ int main(int argc, char **argv) {
             break;
         }
 
+        // socket 被删/被改名：处理完事件后修一下，fd 可能换了，重进 poll
+        if (i_ifd >= 0 && (pfd[i_ifd].revents & POLLIN)) {
+            guard_drain(&guard);
+            guard_repair(&guard);
+            continue;
+        }
         if (i_dfd >= 0 && (pfd[i_dfd].revents & POLLIN)) answer_discovery(dfd);
         // TCP 连接（PC 侧）
         if (pfd[i_lfd].revents & POLLIN) {
@@ -919,6 +1079,7 @@ int main(int argc, char **argv) {
             spawn_conn(c, "unix", lfd, sfd, dfd);
         }
     }
+    if (has_guard && guard.ifd >= 0) close(guard.ifd);
     if (sfd >= 0) {
         close(sfd);
         if (sock_path) unlink(sock_path);    // 退出时清掉 socket 文件
